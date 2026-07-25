@@ -61,6 +61,12 @@ public:
     void paste(JNIEnv* env, jbyteArray data);
     bool dispatchCharacter(int modifiers, int codepoint);
 
+    // Mouse input - generates escape sequences only when the application has
+    // requested mouse tracking (DECSET 1000/1002/1003). Encoding follows the
+    // protocol the application selected (X10, UTF-8, SGR or rxvt).
+    bool mouseMove(int row, int col, int modifiers);
+    bool mouseButton(int button, bool pressed, int modifiers);
+
     // Cell data retrieval for rendering
     int getCells(JNIEnv* env, jobject buffer, int requests);
 

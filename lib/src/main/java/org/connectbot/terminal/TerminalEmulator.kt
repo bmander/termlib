@@ -124,6 +124,59 @@ sealed interface TerminalEmulator {
     fun dispatchCharacter(modifiers: Int, codepoint: Int)
 
     /**
+     * The level of mouse reporting the running application has requested.
+     *
+     * While this is [MouseTracking.NONE] the mouse methods below produce no
+     * output, and gestures should be handled locally (scrollback, selection).
+     * Once an application enables tracking it expects to receive the events
+     * itself — a full-screen program keeps its own scrollback, so scrolling the
+     * terminal's copy would do nothing useful.
+     */
+    val mouseTracking: MouseTracking
+
+    /**
+     * Report the mouse moving to a cell.
+     *
+     * A motion report is only emitted when the application asked for
+     * [MouseTracking.DRAG] (and a button is held) or [MouseTracking.MOVE].
+     * Moving to the cell the mouse already occupies is a no-op, so this is safe
+     * to call for every pointer sample.
+     *
+     * @param row Row index (0-based) within the visible screen
+     * @param col Column index (0-based) within the visible screen
+     * @param modifiers Bitmask: 1=Shift, 2=Alt, 4=Ctrl
+     */
+    fun mouseMove(row: Int, col: Int, modifiers: Int = 0)
+
+    /**
+     * Report a mouse button press or release at a cell.
+     *
+     * Each press must be paired with a release; applications track button state
+     * and a dropped release leaves them believing the button is still down.
+     *
+     * @param row Row index (0-based) within the visible screen
+     * @param col Column index (0-based) within the visible screen
+     * @param modifiers Bitmask: 1=Shift, 2=Alt, 4=Ctrl
+     */
+    fun mouseButton(button: MouseButton, pressed: Boolean, row: Int, col: Int, modifiers: Int = 0)
+
+    /**
+     * Report [steps] wheel detents at a cell.
+     *
+     * This is what lets a scroll gesture reach an application that has taken
+     * over the screen. Callers converting a continuous gesture into detents
+     * should rate-limit: applications commonly throttle or coalesce a flood of
+     * wheel events, so a fling turned into hundreds of detents scrolls less far
+     * than the same distance delivered as a few dozen.
+     *
+     * @param row Row index (0-based) within the visible screen
+     * @param col Column index (0-based) within the visible screen
+     * @param steps Number of detents to report; values below 1 send nothing
+     * @param modifiers Bitmask: 1=Shift, 2=Alt, 4=Ctrl
+     */
+    fun scrollWheel(direction: WheelDirection, row: Int, col: Int, steps: Int = 1, modifiers: Int = 0)
+
+    /**
      * Clears the terminal emulator screen.
      */
     fun clearScreen()
@@ -482,6 +535,12 @@ internal class TerminalEmulatorImpl(
 
     @Volatile private var isAltScreenActive = false
 
+    // Read outside damageLock by gesture handling on the UI thread, written
+    // from the native callback thread.
+    @Volatile
+    override var mouseTracking: MouseTracking = MouseTracking.NONE
+        private set
+
     // Scrollback buffer
     private val scrollback = ArrayDeque<TerminalLine>()
     private val maxScrollbackLines = 1000
@@ -597,6 +656,35 @@ internal class TerminalEmulatorImpl(
             batchOutput {
                 terminalNative.pasteText(text.toByteArray(Charsets.UTF_8))
             }
+        }
+    }
+
+    /**
+     * Report the mouse moving to a cell.
+     */
+    override fun mouseMove(row: Int, col: Int, modifiers: Int) {
+        terminalNative.mouseMove(row, col, modifiers)
+    }
+
+    /**
+     * Report a mouse button press or release at a cell.
+     */
+    override fun mouseButton(button: MouseButton, pressed: Boolean, row: Int, col: Int, modifiers: Int) {
+        terminalNative.mouseMove(row, col, modifiers)
+        terminalNative.mouseButton(button.code, pressed, modifiers)
+    }
+
+    /**
+     * Report wheel detents at a cell.
+     */
+    override fun scrollWheel(direction: WheelDirection, row: Int, col: Int, steps: Int, modifiers: Int) {
+        if (steps < 1) return
+
+        terminalNative.mouseMove(row, col, modifiers)
+        repeat(steps) {
+            // Wheel buttons report a press with no matching release; libvterm
+            // emits one report per call.
+            terminalNative.mouseButton(direction.code, true, modifiers)
         }
     }
 
@@ -781,21 +869,41 @@ internal class TerminalEmulatorImpl(
                 }
 
                 is TerminalProperty.IntValue -> {
-                    // Property 7 is VTERM_PROP_CURSORSHAPE.
-                    if (prop == 7) {
-                        cursorShape = when (value.value) {
-                            1 -> CursorShape.BLOCK
+                    when (prop) {
+                        // Property 7 is VTERM_PROP_CURSORSHAPE.
+                        7 -> {
+                            cursorShape = when (value.value) {
+                                1 -> CursorShape.BLOCK
 
-                            // VTERM_PROP_CURSORSHAPE_BLOCK
-                            2 -> CursorShape.UNDERLINE
+                                // VTERM_PROP_CURSORSHAPE_BLOCK
+                                2 -> CursorShape.UNDERLINE
 
-                            // VTERM_PROP_CURSORSHAPE_UNDERLINE
-                            3 -> CursorShape.BAR_LEFT
+                                // VTERM_PROP_CURSORSHAPE_UNDERLINE
+                                3 -> CursorShape.BAR_LEFT
 
-                            // VTERM_PROP_CURSORSHAPE_BAR_LEFT
-                            else -> CursorShape.BLOCK
+                                // VTERM_PROP_CURSORSHAPE_BAR_LEFT
+                                else -> CursorShape.BLOCK
+                            }
+                            propertyChanged = true
                         }
-                        propertyChanged = true
+
+                        // Property 8 is VTERM_PROP_MOUSE (from vterm.h line 261)
+                        8 -> {
+                            mouseTracking = when (value.value) {
+                                // VTERM_PROP_MOUSE_CLICK
+                                1 -> MouseTracking.CLICK
+
+                                // VTERM_PROP_MOUSE_DRAG
+                                2 -> MouseTracking.DRAG
+
+                                // VTERM_PROP_MOUSE_MOVE
+                                3 -> MouseTracking.MOVE
+
+                                // VTERM_PROP_MOUSE_NONE
+                                else -> MouseTracking.NONE
+                            }
+                            propertyChanged = true
+                        }
                     }
                 }
 
