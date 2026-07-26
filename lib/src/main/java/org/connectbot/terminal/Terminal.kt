@@ -1375,10 +1375,8 @@ internal fun TerminalWithAccessibility(
                                             WheelScroller(
                                                 emulator = terminalEmulator,
                                                 lineHeightPx = baseCharHeight,
-                                                anchorRow = (down.position.y / baseCharHeight).toInt()
-                                                    .coerceIn(0, screenState.snapshot.rows - 1),
-                                                anchorCol = (down.position.x / baseCharWidth).toInt()
-                                                    .coerceIn(0, screenState.snapshot.cols - 1),
+                                                anchorRow = (down.position.y / baseCharHeight).toInt(),
+                                                anchorCol = (down.position.x / baseCharWidth).toInt(),
                                             )
                                         } else {
                                             null
@@ -1536,6 +1534,15 @@ internal fun TerminalWithAccessibility(
                                 val tapRow = (down.position.y / baseCharHeight).toInt()
                                     .coerceIn(0, screenState.snapshot.rows - 1)
 
+                                // Request focus when terminal is tapped to show keyboard
+                                fun forwardTap() {
+                                    if (currentKeyboardEnabled) {
+                                        focusRequester.requestFocus()
+                                        if (currentShouldShowIme) imeInputView?.showIme()
+                                    }
+                                    currentOnTerminalTap()
+                                }
+
                                 if (selectionManager.mode != SelectionMode.NONE) {
                                     selectionManager.clearSelection()
                                 } else if (terminalEmulator.mouseTracking.isEnabled) {
@@ -1546,10 +1553,7 @@ internal fun TerminalWithAccessibility(
                                     // Long-press selection stays local: it remains the way
                                     // to copy text out of a full-screen application.
                                     terminalEmulator.mouseClick(MouseButton.LEFT, tapRow, tapCol)
-                                    if (keyboardEnabled) {
-                                        focusRequester.requestFocus()
-                                    }
-                                    currentOnTerminalTap()
+                                    forwardTap()
                                 } else {
                                     // Check if tap is on a hyperlink
                                     val hyperlinkUrl = screenState.getHyperlinkUrlAt(
@@ -1562,12 +1566,7 @@ internal fun TerminalWithAccessibility(
                                         // User tapped on a hyperlink
                                         currentOnHyperlinkClick(hyperlinkUrl)
                                     } else {
-                                        // Request focus when terminal is tapped to show keyboard
-                                        if (currentKeyboardEnabled) {
-                                            focusRequester.requestFocus()
-                                            if (currentShouldShowIme) imeInputView?.showIme()
-                                        }
-                                        currentOnTerminalTap()
+                                        forwardTap()
                                     }
                                 }
                                 // Record tap for double-tap detection
