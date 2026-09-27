@@ -60,6 +60,9 @@ internal class TerminalScreenState(
     var snapshot by mutableStateOf(initialSnapshot)
         private set
 
+    /** Called before a new snapshot replaces the one used by selection anchors. */
+    internal var onSnapshotChanged: ((TerminalSnapshot, TerminalSnapshot) -> Unit)? = null
+
     /**
      * Current scroll position in the scrollback buffer.
      * 0 = bottom (current screen), >0 = scrolled back in history
@@ -118,6 +121,12 @@ internal class TerminalScreenState(
                 defaultBg = androidx.compose.ui.graphics.Color.Black,
             )
         }
+    }
+
+    /** Absolute history index for a viewport row. */
+    internal fun visibleLineIndex(row: Int): Int {
+        val first = snapshot.scrollback.size - scrollbackPosition
+        return (first + row).coerceIn(0, totalLines - 1)
     }
 
     /**
@@ -352,6 +361,7 @@ internal class TerminalScreenState(
     internal fun updateSnapshot(newSnapshot: TerminalSnapshot) {
         val oldScrollbackSize = snapshot.scrollback.size
         val newScrollbackSize = newSnapshot.scrollback.size
+        onSnapshotChanged?.invoke(snapshot, newSnapshot)
         snapshot = newSnapshot
         if (scrollbackPosition != 0) {
             val delta = newScrollbackSize - oldScrollbackSize
@@ -385,7 +395,10 @@ internal fun rememberTerminalScreenState(
     // state.snapshot still invalidate/recompose any composables that read it.
     LaunchedEffect(terminalEmulator) {
         terminalEmulator.snapshot.collect { newSnapshot ->
-            state.updateSnapshot(newSnapshot)
+            if (newSnapshot === state.snapshot) return@collect
+            androidx.compose.runtime.withFrameNanos {
+                state.updateSnapshot(terminalEmulator.snapshot.value)
+            }
         }
     }
 

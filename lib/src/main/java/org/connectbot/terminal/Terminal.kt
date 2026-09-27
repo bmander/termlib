@@ -38,13 +38,15 @@ import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.calculatePan
 import androidx.compose.foundation.gestures.calculateZoom
-import androidx.compose.foundation.gestures.drag
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.isImeVisible
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
@@ -68,17 +70,20 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.drawscope.DrawScope
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.scale
 import androidx.compose.ui.graphics.drawscope.translate
 import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
@@ -88,6 +93,7 @@ import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.pointer.PointerEvent
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerInputChange
+import androidx.compose.ui.input.pointer.PointerType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.input.pointer.util.VelocityTracker
@@ -98,7 +104,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalInspectionMode
-import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalViewConfiguration
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
@@ -116,10 +121,11 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.ceil
 import androidx.compose.ui.input.key.KeyEvent as ComposeKeyEvent
 
-private val DRAW_TEXT_BUFFER = ThreadLocal.withInitial { CharArray(1) }
 private val CURLY_UNDERLINE_PATH = ThreadLocal.withInitial { Path() }
 
 /**
@@ -153,20 +159,16 @@ private const val MAGNIFIER_SIZE_DP = 100
  */
 private const val MAGNIFIER_SCALE = 2.5f
 
-/**
- * Delay in milliseconds before showing the IME (Input Method Editor).
- */
-private const val IME_SHOW_DELAY_MS = 100L
+private val SELECTION_EDGE_INSET = 48.dp
+private val SELECTION_EDGE_TRANSITION = 192.dp
 
 /**
  * Delay in milliseconds to allow UI to settle before requesting focus.
  */
 private const val UI_SETTLE_DELAY_MS = 100L
 
-/**
- * Delay in milliseconds before showing the soft keyboard.
- */
-private const val KEYBOARD_SHOW_DELAY_MS = 50L
+/** Wait for transient TUI cursor moves to return before invalidating IME suggestion context. */
+private const val IME_CONTEXT_SETTLE_DELAY_MS = 300L
 
 /**
  * Border width for the terminal display in dp.
@@ -194,9 +196,9 @@ private val COPY_BUTTON_SIZE = 48.dp
 private val COPY_BUTTON_OFFSET = 48.dp
 
 /**
- * Touch radius in pixels for detecting selection handle touches.
+ * Touch radius in dp for detecting selection handle touches.
  */
-private const val HANDLE_HIT_RADIUS = 80f
+private val HANDLE_HIT_RADIUS = 40.dp
 
 /**
  * Vertical offset in dp to position the magnifier above (or below) the finger.
@@ -207,11 +209,6 @@ private val MAGNIFIER_VERTICAL_OFFSET = 40.dp
  * Estimated finger contact height in dp, used to avoid positioning the magnifier under the finger.
  */
 private val FINGER_HEIGHT_DP = 50.dp
-
-/**
- * Center offset multiplier for magnifier positioning.
- */
-private const val MAGNIFIER_CENTER_OFFSET_MULTIPLIER = 1.2f
 
 /**
  * Border width for the magnifier loupe in dp.
@@ -234,24 +231,22 @@ private const val MAGNIFIER_ROW_RANGE = 3
 private val SELECTION_HANDLE_WIDTH = 24.dp
 
 /**
- * Alpha value for the block cursor.
+ * When in line selection mode, we will draw a handle in the middle.
  */
-private const val CURSOR_BLOCK_ALPHA = 0.7f
+private val LINE_HANDLE_WIDTH = 48.dp
+private val LINE_HANDLE_HEIGHT = 18.dp
+private val LINE_HANDLE_GAP = 8.dp
+private val LINE_HANDLE_HIT_RADIUS = 24.dp
 
 /**
- * Alpha value for the underline and bar cursors.
+ * In selection mode, how close to the edge of the screen we get before starting to scroll.
+ */
+private val SELECTION_AUTO_SCROLL_EDGE = 40.dp
+
+/**
+ * Alpha value for the compose-mode cursor.
  */
 private const val CURSOR_LINE_ALPHA = 0.9f
-
-/**
- * Percentage of cell height for underline cursor (0.0 to 1.0).
- */
-private const val CURSOR_UNDERLINE_HEIGHT_RATIO = 0.15f
-
-/**
- * Percentage of cell width for bar cursor (0.0 to 1.0).
- */
-private const val CURSOR_BAR_WIDTH_RATIO = 0.15f
 
 /**
  * Convergence threshold for binary search when finding optimal font size.
@@ -294,6 +289,9 @@ private const val DOUBLE_UNDERLINE_SPACING = 2f
  *                        When false, no keyboard input (hardware or soft) is accepted.
  * @param showSoftKeyboard Whether to show the soft keyboard/IME (default: true when keyboardEnabled=true).
  *                         Only applies when keyboardEnabled=true. Hardware keyboard always works when keyboardEnabled=true.
+ *                         Allows explicit show requests; dismissing the IME leaves it hidden until another request.
+ * @param resizeSuspended Retain terminal dimensions during temporary host layouts (for example a menu).
+ *                        Release after the final layout is restored to apply only the latest dimensions.
  * @param focusRequester Focus requester for keyboard input (if enabled)
  * @param onTerminalTap Callback for a simple tap event on the terminal (when no selection is active)
  * @param onImeVisibilityChanged Callback invoked when IME visibility changes (true = shown, false = hidden)
@@ -303,8 +301,9 @@ private const val DOUBLE_UNDERLINE_SPACING = 2f
  * @param onComposeControllerAvailable Optional callback providing access to the ComposeController for handling IME compose state
  * @param onPasteRequest Optional callback for handling a request to paste content, normally triggered by a context menu action
  * @param rightAltMode How the right-alt key should behave (CharacterModifier vs Meta)
- * @param selectionBackgroundColor Background color for selected text (default: 0xFFB3D7FF)
- * @param selectionForegroundColor Foreground color for selected text (default: Black)
+ * @param selectionBackgroundColor Optional fixed selection background. Both selection colors unspecified invert pixels;
+ *                                 supplying either color uses fixed colors, with pale blue as the background fallback.
+ * @param selectionForegroundColor Optional fixed selection foreground, with black as the fixed-color fallback.
  * @param delKeyMode How the backspace/delete keys should map to terminal characters
  * @param onInterceptKey Optional callback to intercept raw Compose KeyEvents before the terminal emulator handles them. Return true to consume the event.
  */
@@ -318,8 +317,8 @@ fun Terminal(
     maxFontSize: TextUnit = 30.sp,
     backgroundColor: Color = Color.Black,
     foregroundColor: Color = Color.White,
-    selectionBackgroundColor: Color = Color(0xFFB3D7FF),
-    selectionForegroundColor: Color = Color.Black,
+    selectionBackgroundColor: Color = Color.Unspecified,
+    selectionForegroundColor: Color = Color.Unspecified,
     keyboardEnabled: Boolean = false,
     showSoftKeyboard: Boolean = true,
     focusRequester: FocusRequester = remember { FocusRequester() },
@@ -334,6 +333,7 @@ fun Terminal(
     rightAltMode: RightAltMode = RightAltMode.CharacterModifier,
     delKeyMode: DelKeyMode = DelKeyMode.Delete,
     onInterceptKey: ((ComposeKeyEvent) -> Boolean)? = null,
+    resizeSuspended: Boolean = false,
 ) {
     if (LocalInspectionMode.current) {
         TerminalPreview(modifier, backgroundColor, foregroundColor)
@@ -366,6 +366,7 @@ fun Terminal(
         selectionBackgroundColor = selectionBackgroundColor,
         selectionForegroundColor = selectionForegroundColor,
         delKeyMode = delKeyMode,
+        resizeSuspended = resizeSuspended,
     )
 }
 
@@ -375,6 +376,7 @@ fun Terminal(
  * @see Terminal
  */
 @VisibleForTesting
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 internal fun TerminalWithAccessibility(
     terminalEmulator: TerminalEmulator,
@@ -400,9 +402,10 @@ internal fun TerminalWithAccessibility(
     onPasteRequest: (() -> Unit)? = null,
     onInterceptKey: ((ComposeKeyEvent) -> Boolean)? = null,
     rightAltMode: RightAltMode = RightAltMode.CharacterModifier,
-    selectionBackgroundColor: Color = Color(0xFFB3D7FF),
-    selectionForegroundColor: Color = Color.Black,
+    selectionBackgroundColor: Color = Color.Unspecified,
+    selectionForegroundColor: Color = Color.Unspecified,
     delKeyMode: DelKeyMode = DelKeyMode.Delete,
+    resizeSuspended: Boolean = false,
 ) {
     if (terminalEmulator !is TerminalEmulatorImpl) {
         Box(
@@ -419,11 +422,11 @@ internal fun TerminalWithAccessibility(
     val currentOnTerminalTap by rememberUpdatedState(onTerminalTap)
     val currentOnHyperlinkClick by rememberUpdatedState(onHyperlinkClick)
     val currentOnInterceptKey by rememberUpdatedState(onInterceptKey)
+    val currentKeyboardEnabled by rememberUpdatedState(keyboardEnabled)
 
     val density = LocalDensity.current
     val haptic = LocalHapticFeedback.current
     val clipboardManager = LocalClipboardManager.current
-    val keyboardController = LocalSoftwareKeyboardController.current
     val scope = rememberCoroutineScope()
 
     // Track accessibility state - only enable accessibility features when needed
@@ -435,7 +438,7 @@ internal fun TerminalWithAccessibility(
 
     // Keyboard handler (will be updated with selectionController after it's created)
     val keyboardHandler = remember(terminalEmulator) {
-        KeyboardHandler(terminalEmulator, modifierManager)
+        KeyboardHandler(QueuedTerminal(terminalEmulator), modifierManager)
     }
     SideEffect {
         keyboardHandler.onInterceptKey = currentOnInterceptKey
@@ -448,17 +451,20 @@ internal fun TerminalWithAccessibility(
     var isZooming by remember(terminalEmulator) { mutableStateOf(false) }
     var isUserScrolling by remember(terminalEmulator) { mutableStateOf(false) }
     var isDraggingHandle by remember(terminalEmulator) { mutableStateOf(false) }
-    var calculatedFontSize by remember(terminalEmulator) { mutableStateOf(initialFontSize) }
+    var measuredWidth by remember { mutableStateOf(0) }
+    var measuredHeight by remember { mutableStateOf(0) }
+    var retainedWidth by remember { mutableStateOf(0) }
+    var retainedHeight by remember { mutableStateOf(0) }
+    val availableWidth = if (resizeSuspended) retainedWidth else measuredWidth
+    val availableHeight = if (resizeSuspended) retainedHeight else measuredHeight
 
     // Magnifying glass state
     var showMagnifier by remember(terminalEmulator) { mutableStateOf(false) }
-    var magnifierPosition by remember(terminalEmulator) { mutableStateOf(Offset.Zero) }
+    var magnifierFingerPosition by remember(terminalEmulator) { mutableStateOf(Offset.Zero) }
+    var magnifierTargetPosition by remember(terminalEmulator) { mutableStateOf(Offset.Zero) }
 
     // Cursor blink state
     var cursorBlinkVisible by remember(terminalEmulator) { mutableStateOf(true) }
-
-    // IME text field state (hidden BasicTextField for capturing IME input)
-    val imeFocusRequester = remember { FocusRequester() }
 
     // Review Mode state for accessibility
     var isReviewMode by remember(terminalEmulator) { mutableStateOf(false) }
@@ -472,32 +478,52 @@ internal fun TerminalWithAccessibility(
 
     // Keep reference to ImeInputView for controlling IME
     var imeInputView by remember { mutableStateOf<ImeInputView?>(null) }
+    val currentInputView = imeInputView
+    val imeVisible = WindowInsets.isImeVisible
+    val currentVisibilityCallback by rememberUpdatedState(onImeVisibilityChanged)
+    val currentShouldShowIme by rememberUpdatedState(shouldShowIme)
+    var restoreAfterReview by remember { mutableStateOf(false) }
+    var reviewExitedByKey by remember { mutableStateOf(false) }
+    SideEffect {
+        currentInputView?.imeAllowed = shouldShowIme && !isReviewMode
+        currentInputView?.observeImeVisibility(imeVisible)
+    }
+    LaunchedEffect(imeVisible) { currentVisibilityCallback(imeVisible) }
 
     // Cleanup IME when component is disposed
-    DisposableEffect(imeInputView) {
+    DisposableEffect(currentInputView) {
         onDispose {
             Log.d("Terminal", "Disposing Terminal - hiding IME")
-            imeInputView?.hideIme()
+            currentInputView?.hideIme()
         }
     }
 
     // React to IME state changes
-    LaunchedEffect(shouldShowIme, imeInputView) {
+    LaunchedEffect(shouldShowIme, currentInputView) {
         Log.d("Terminal", "IME state changed: shouldShowIme=$shouldShowIme (imeInputView=$imeInputView)")
 
-        imeInputView?.let { view ->
+        currentInputView?.let { view ->
             if (shouldShowIme) {
-                Log.d("Terminal", "Showing IME via InputMethodManager")
-                delay(IME_SHOW_DELAY_MS)
-                view.showIme()
-                Log.d("Terminal", "IME show completed")
-                onImeVisibilityChanged(true)
+                Log.d("Terminal", "Requesting IME for terminal editor")
+                if (!isReviewMode) view.showIme()
             } else {
                 Log.d("Terminal", "Hiding IME via InputMethodManager")
                 view.hideIme()
                 Log.d("Terminal", "IME hide completed")
-                onImeVisibilityChanged(false)
             }
+        }
+    }
+
+    // The IME may retain a recently committed word so suggestion taps can replace it. Once
+    // terminal output settles, keep that context only when it still precedes the cursor.
+    // This prevents a TUI redraw or cursor movement from editing text at the old location.
+    LaunchedEffect(screenState, imeInputView) {
+        snapshotFlow {
+            val snapshot = screenState.snapshot
+            Triple(snapshot.cursorRow, snapshot.cursorCol, snapshot.textBeforeCursor())
+        }.collectLatest { (_, _, textBeforeCursor) ->
+            delay(IME_CONTEXT_SETTLE_DELAY_MS)
+            imeInputView?.validateTerminalCursorContext(textBeforeCursor)
         }
     }
 
@@ -505,7 +531,8 @@ internal fun TerminalWithAccessibility(
     LaunchedEffect(isReviewMode) {
         if (isReviewMode) {
             // Entering Review Mode: hide keyboard, focus on accessibility overlay
-            keyboardController?.hide()
+            restoreAfterReview = imeVisible
+            imeInputView?.hideIme()
             delay(UI_SETTLE_DELAY_MS)
             try {
                 reviewFocusRequester.requestFocus()
@@ -514,12 +541,12 @@ internal fun TerminalWithAccessibility(
             }
         } else {
             // Exiting Review Mode: return focus to input field if keyboard enabled
-            if (keyboardEnabled && shouldShowIme) {
-                delay(UI_SETTLE_DELAY_MS)
-                imeFocusRequester.requestFocus()
-                delay(KEYBOARD_SHOW_DELAY_MS)
-                keyboardController?.show()
+            if (keyboardEnabled && (restoreAfterReview || reviewExitedByKey)) {
+                imeInputView?.requestFocus()
+                if (shouldShowIme && restoreAfterReview && !reviewExitedByKey) imeInputView?.showIme()
             }
+            restoreAfterReview = false
+            reviewExitedByKey = false
         }
     }
 
@@ -545,12 +572,33 @@ internal fun TerminalWithAccessibility(
     }
 
     // Create TextPaint for measuring and drawing (base size)
-    val textPaint = remember(typeface, calculatedFontSize) {
-        TextPaint().apply {
-            this.typeface = typeface
-            textSize = with(density) { calculatedFontSize.toPx() }
-            isAntiAlias = true
+    val calculatedFontSize = remember(forcedSize, availableWidth, availableHeight, initialFontSize, minFontSize, maxFontSize, typeface, density) {
+        if (forcedSize != null && availableWidth > 0 && availableHeight > 0) {
+            findOptimalFontSize(
+                targetRows = forcedSize.first,
+                targetCols = forcedSize.second,
+                availableWidth = availableWidth,
+                availableHeight = availableHeight,
+                minSize = minFontSize.value,
+                maxSize = maxFontSize.value,
+                typeface = typeface,
+                density = density.density,
+            ).sp
+        } else {
+            initialFontSize
         }
+    }
+    val requestedPaint = remember(typeface, calculatedFontSize, density) {
+        TerminalTextPaint(typeface, with(density) { calculatedFontSize.toPx() })
+    }
+    var retainedPaint by remember(terminalEmulator) { mutableStateOf<TerminalTextPaint?>(null) }
+    val terminalInversion = remember { TerminalInversion() }
+    val textPaint = if (resizeSuspended) retainedPaint ?: requestedPaint else requestedPaint
+    SideEffect { if (!resizeSuspended) retainedPaint = textPaint }
+
+    textPaint.viewport(screenState)
+    DisposableEffect(textPaint) {
+        onDispose { textPaint.clearShaping() }
     }
 
     // Base character dimensions (unzoomed)
@@ -568,6 +616,33 @@ internal fun TerminalWithAccessibility(
 
     val baseCharBaseline = remember(textPaint) {
         ceil(-textPaint.fontMetrics.ascent)
+    }
+    LaunchedEffect(terminalEmulator, baseCharWidth, baseCharHeight) {
+        terminalEmulator.commands.execute {
+            terminalEmulator.setCellPixelSize(ceil(baseCharWidth).toInt().coerceAtLeast(1), baseCharHeight.toInt().coerceAtLeast(1))
+        }
+    }
+    LaunchedEffect(terminalEmulator, baseCharWidth, baseCharHeight) {
+        val store = terminalEmulator.imageStore
+        snapshotFlow { Triple(screenState.snapshot, screenState.scrollbackPosition, store.frameUpdatesNeeded) }.collectLatest { (_, _, needsFrames) ->
+            val slices = (0 until screenState.snapshot.rows).flatMap { screenState.getVisibleLine(it).images }
+            store.updateViewport(ImageViewport(-screenState.scrollbackPosition, slices, baseCharWidth, baseCharHeight, android.os.SystemClock.uptimeMillis()))
+            if (slices.isEmpty() || !needsFrames) return@collectLatest
+            while (true) {
+                // Also yield with synthetic/immediate clocks; a static image goes idle
+                // as soon as maintenance publishes that its decode has completed.
+                delay(1)
+                androidx.compose.runtime.withFrameNanos { frameTime ->
+                    store.updateViewport(ImageViewport(-screenState.scrollbackPosition, slices, baseCharWidth, baseCharHeight, frameTime / 1_000_000L))
+                }
+            }
+        }
+    }
+    DisposableEffect(terminalEmulator) {
+        onDispose {
+            val store = terminalEmulator.imageStore
+            store.updateViewport(ImageViewport(0, emptyList(), 1f, 1f, 0, attached = false))
+        }
     }
     val underlinePaint = remember {
         Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -589,9 +664,12 @@ internal fun TerminalWithAccessibility(
     val selectionManager = remember(terminalEmulator) {
         SelectionManager()
     }
+    SideEffect {
+        screenState.onSnapshotChanged = selectionManager::onSnapshotChanged
+    }
 
     // Selection controller - expose API for external control
-    val selectionController = remember(terminalEmulator, selectionManager, clipboardManager, screenState) {
+    val selectionController = remember(terminalEmulator, selectionManager, clipboardManager, screenState, textPaint, baseCharWidth) {
         object : SelectionController {
             override val isSelectionActive: Boolean
                 get() = selectionManager.mode != SelectionMode.NONE
@@ -614,19 +692,19 @@ internal fun TerminalWithAccessibility(
             }
 
             override fun moveSelectionUp() {
-                selectionManager.moveSelectionUp(screenState.snapshot.rows)
+                selectionManager.moveVisually(0, -1, screenState, textPaint, baseCharWidth)
             }
 
             override fun moveSelectionDown() {
-                selectionManager.moveSelectionDown(screenState.snapshot.rows)
+                selectionManager.moveVisually(0, 1, screenState, textPaint, baseCharWidth)
             }
 
             override fun moveSelectionLeft() {
-                selectionManager.moveSelectionLeft(screenState.snapshot.cols)
+                selectionManager.moveVisually(-1, 0, screenState, textPaint, baseCharWidth)
             }
 
             override fun moveSelectionRight() {
-                selectionManager.moveSelectionRight(screenState.snapshot.cols)
+                selectionManager.moveVisually(1, 0, screenState, textPaint, baseCharWidth)
             }
 
             override fun toggleSelectionMode() {
@@ -638,7 +716,19 @@ internal fun TerminalWithAccessibility(
             }
 
             override fun selectAll() {
-                selectionManager.selectAll(screenState.snapshot.rows, screenState.snapshot.cols)
+                selectionManager.selectAll(
+                    screenState.snapshot.rows,
+                    screenState.snapshot.cols,
+                    screenState.snapshot.scrollback.size,
+                )
+            }
+
+            override fun selectAllVisible() {
+                selectionManager.selectAllVisible(
+                    screenState.snapshot.rows,
+                    screenState.snapshot.cols,
+                    screenState.visibleLineIndex(0),
+                )
             }
 
             override fun finishSelection() {
@@ -679,8 +769,12 @@ internal fun TerminalWithAccessibility(
             override fun stopComposeMode() {
                 // Flush any in-flight IME composition into the terminal before leaving
                 // compose mode, so the user's typing isn't silently dropped on toggle off.
-                composeMode.commit()?.codePoints()?.forEach { codepoint ->
-                    terminalEmulator.dispatchCharacter(0, codepoint)
+                composeMode.commit()?.let { text ->
+                    terminalEmulator.commands.execute {
+                        terminalEmulator.batchOutput {
+                            text.codePoints().forEach { terminalEmulator.dispatchCharacter(0, it) }
+                        }
+                    }
                 }
                 composeMode.deactivate()
             }
@@ -691,6 +785,10 @@ internal fun TerminalWithAccessibility(
                 } else {
                     startComposeMode()
                 }
+            }
+
+            override fun syncImeShortcutInputMode(mode: ImeShortcutInputMode) {
+                imeInputView?.syncShortcutInputMode(mode)
             }
 
             override fun getComposedText(): String = composeMode.buffer
@@ -790,15 +888,25 @@ internal fun TerminalWithAccessibility(
     }
     val viewConfiguration = LocalViewConfiguration.current
 
-    var availableWidth by remember { mutableStateOf(0) }
-    var availableHeight by remember { mutableStateOf(0) }
+    val resizePaused = remember(terminalEmulator) { AtomicBoolean(resizeSuspended) }
+    val resizeGeneration = remember(terminalEmulator) { AtomicLong() }
+    SideEffect {
+        if (resizePaused.getAndSet(resizeSuspended) != resizeSuspended) resizeGeneration.incrementAndGet()
+        if (!resizeSuspended) {
+            retainedWidth = measuredWidth
+            retainedHeight = measuredHeight
+        }
+    }
+    DisposableEffect(resizeGeneration) {
+        onDispose { resizeGeneration.incrementAndGet() }
+    }
 
     Box(
         modifier = modifier
             .fillMaxSize()
             .onSizeChanged {
-                availableWidth = it.width
-                availableHeight = it.height
+                measuredWidth = it.width
+                measuredHeight = it.height
             }
             .then(
                 if (keyboardEnabled) {
@@ -820,6 +928,7 @@ internal fun TerminalWithAccessibility(
                                     // Don't consume - let system handle
                                     else -> {
                                         // Any other key exits Review Mode and goes to shell
+                                        reviewExitedByKey = true
                                         isReviewMode = false
                                         keyboardHandler.onKeyEvent(event)
                                     }
@@ -834,37 +943,18 @@ internal fun TerminalWithAccessibility(
                 },
             ),
     ) {
-        // Calculate font size if forcedSize is specified
-        if (forcedSize != null) {
-            val (forcedRows, forcedCols) = forcedSize
-            LaunchedEffect(availableWidth, availableHeight, forcedRows, forcedCols) {
-                if (availableWidth == 0 || availableHeight == 0) {
-                    return@LaunchedEffect
-                }
-
-                val optimalSize = findOptimalFontSize(
-                    targetRows = forcedRows,
-                    targetCols = forcedCols,
-                    availableWidth = availableWidth,
-                    availableHeight = availableHeight,
-                    minSize = minFontSize.value,
-                    maxSize = maxFontSize.value,
-                    typeface = typeface,
-                    density = density.density,
-                )
-                calculatedFontSize = optimalSize.sp
-            }
-        } else {
-            // When not forcing size, reset the font size to the initial value.
-            LaunchedEffect(initialFontSize) {
-                if (calculatedFontSize != initialFontSize) {
-                    calculatedFontSize = initialFontSize
-                }
-            }
-        }
-
         // Resize terminal when dimensions change
-        LaunchedEffect(terminalEmulator, availableWidth, availableHeight, forcedSize, baseCharWidth, baseCharHeight) {
+        LaunchedEffect(
+            terminalEmulator,
+            availableWidth,
+            availableHeight,
+            forcedSize,
+            baseCharWidth,
+            baseCharHeight,
+            resizeSuspended,
+        ) {
+            val generation = resizeGeneration.incrementAndGet()
+            if (resizeSuspended) return@LaunchedEffect
             if (availableWidth == 0 || availableHeight == 0 || baseCharWidth <= 0f || baseCharHeight <= 0f) {
                 return@LaunchedEffect
             }
@@ -875,24 +965,35 @@ internal fun TerminalWithAccessibility(
             val newRows =
                 forcedSize?.first ?: charsPerDimension(availableHeight, baseCharHeight)
 
+            val widthPixels =
+                if (forcedSize == null) availableWidth else ceil(newCols * baseCharWidth).toInt()
+            val heightPixels =
+                if (forcedSize == null) availableHeight else ceil(newRows * baseCharHeight).toInt()
             val dimensions = terminalEmulator.dimensions
-            if (newRows != dimensions.rows || newCols != dimensions.columns) {
-                terminalEmulator.resize(newRows, newCols)
-
-                // If selection is active, ensure it stays within the new visible bounds.
-                // This ensures the Copy button resets to the last visible line when the screen
-                // shrinks (e.g. keyboard up) without forcing a scroll to the bottom.
-                if (selectionManager.mode != SelectionMode.NONE) {
-                    selectionManager.clampToDimensions(newRows, newCols)
+            if (
+                newRows != dimensions.rows ||
+                newCols != dimensions.columns ||
+                widthPixels != dimensions.widthPixels ||
+                heightPixels != dimensions.heightPixels
+            ) {
+                terminalEmulator.commands.execute {
+                    if (!resizePaused.get() && resizeGeneration.get() == generation) {
+                        val current = terminalEmulator.dimensions
+                        if (current.rows != newRows || current.columns != newCols ||
+                            current.widthPixels != widthPixels || current.heightPixels != heightPixels
+                        ) {
+                            terminalEmulator.resize(newRows, newCols, widthPixels, heightPixels)
+                        }
+                    }
                 }
             }
         }
 
         // Use base dimensions for terminal sizing (not zoomed dimensions)
         val newCols =
-            forcedSize?.second ?: charsPerDimension(availableWidth, baseCharWidth)
+            if (resizeSuspended) screenState.snapshot.cols else forcedSize?.second ?: charsPerDimension(availableWidth, baseCharWidth)
         val newRows =
-            forcedSize?.first ?: charsPerDimension(availableHeight, baseCharHeight)
+            if (resizeSuspended) screenState.snapshot.rows else forcedSize?.first ?: charsPerDimension(availableHeight, baseCharHeight)
 
         // Auto-scroll to bottom when new content arrives (if not manually scrolled)
         LaunchedEffect(screenState) {
@@ -943,7 +1044,82 @@ internal fun TerminalWithAccessibility(
                     awaitEachGesture {
                         var gestureType: GestureType = GestureType.Undetermined
                         val down = awaitFirstDown(requireUnconsumed = false)
+                        val isFinger = down.type == PointerType.Touch
+                        val releaseFilter = SelectionReleaseFilter<SelectionRange>()
+                        fun selectionPoint(raw: Offset, edgeReach: Boolean = isFinger): Offset {
+                            val point = if (edgeReach) {
+                                edgeReachPosition(
+                                    raw,
+                                    size.width.toFloat(),
+                                    size.height.toFloat(),
+                                    with(density) { SELECTION_EDGE_INSET.toPx() },
+                                    with(density) { SELECTION_EDGE_TRANSITION.toPx() },
+                                )
+                            } else {
+                                raw
+                            }
+                            val snapshot = screenState.snapshot
+                            val maxX = (snapshot.cols * baseCharWidth - minOf(0.5f, baseCharWidth / 2f)).coerceAtLeast(0f)
+                            val maxY = (snapshot.rows * baseCharHeight - minOf(0.5f, baseCharHeight / 2f)).coerceAtLeast(0f)
+                            return Offset(point.x.coerceIn(0f, maxX), point.y.coerceIn(0f, maxY))
+                        }
+                        var autoScrollPointer = down.position
+                        var autoScrolled = false
+                        var onAutoScroll: (() -> Unit)? = null
+                        var autoScrollJob: Job? = null
+                        fun startAutoScroll() {
+                            if (autoScrollJob != null) return
+                            autoScrollJob = launch {
+                                var fractionalRows = 0f
+                                while (true) {
+                                    delay(16)
+                                    val velocity = selectionAutoScrollVelocity(
+                                        autoScrollPointer.y,
+                                        size.height.toFloat(),
+                                        with(density) { SELECTION_AUTO_SCROLL_EDGE.toPx() },
+                                    )
+                                    if (velocity == 0f) {
+                                        fractionalRows = 0f
+                                        continue
+                                    }
+                                    fractionalRows += kotlin.math.abs(velocity) * 0.016f
+                                    val rows = fractionalRows.toInt()
+                                    if (rows == 0) continue
+                                    fractionalRows -= rows
+                                    val previous = screenState.scrollbackPosition
+                                    screenState.scrollBy(if (velocity > 0f) rows else -rows)
+                                    if (screenState.scrollbackPosition != previous) {
+                                        autoScrolled = true
+                                        onAutoScroll?.invoke()
+                                    }
+                                }
+                            }
+                        }
+                        fun selectAt(position: Offset, time: Long) {
+                            val target = selectionPoint(position)
+                            val col = (target.x / baseCharWidth).toInt().coerceIn(0, screenState.snapshot.cols - 1)
+                            val row = (target.y / baseCharHeight).toInt().coerceIn(0, screenState.snapshot.rows - 1)
+                            selectionManager.updateSelection(
+                                screenState.visibleLineIndex(row),
+                                textPaint.logicalColumn(screenState, row, col, baseCharWidth),
+                            )
+                            selectionManager.adjustSelectionForMode(
+                                screenState.snapshot.cols,
+                                screenState.snapshot,
+                                screenState.scrollbackPosition,
+                            )
+                            selectionManager.selectionRange?.let { releaseFilter.record(it, time) }
+                            magnifierFingerPosition = position
+                            magnifierTargetPosition = target
+                        }
                         scrollJob?.cancel()
+
+                        // Who this gesture belongs to is decided once, here, and
+                        // read by both the scroll and tap paths below. An
+                        // application that enables or drops mouse tracking
+                        // mid-gesture should not take a gesture that began as
+                        // ours, or abandon one halfway through.
+                        val appOwnsPointer = terminalEmulator.mouseTracking.isEnabled
 
                         // 1a. Check for double-tap to start word selection
                         val isDoubleTap = (down.uptimeMillis - tapTracker.lastTimestamp) < viewConfiguration.doubleTapTimeoutMillis &&
@@ -951,14 +1127,19 @@ internal fun TerminalWithAccessibility(
 
                         if (isDoubleTap) {
                             gestureType = GestureType.Selection
-                            val tapCol = (down.position.x / baseCharWidth).toInt()
+                            val target = selectionPoint(down.position)
+                            val tapCol = (target.x / baseCharWidth).toInt()
                                 .coerceIn(0, screenState.snapshot.cols - 1)
-                            val tapRow = (down.position.y / baseCharHeight).toInt()
+                            val tapRow = (target.y / baseCharHeight).toInt()
                                 .coerceIn(0, screenState.snapshot.rows - 1)
-                            selectionManager.startSelection(tapRow, tapCol, screenState.snapshot.cols, SelectionMode.WORD, screenState.snapshot, screenState.scrollbackPosition)
+                            selectionManager.startSelection(tapRow, textPaint.logicalColumn(screenState, tapRow, tapCol, baseCharWidth), screenState.snapshot.cols, SelectionMode.WORD, screenState.snapshot, screenState.scrollbackPosition)
+                            selectionManager.selectionRange?.let { releaseFilter.record(it, down.uptimeMillis) }
                             haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                             showMagnifier = true
-                            magnifierPosition = down.position
+                            magnifierFingerPosition = down.position
+                            magnifierTargetPosition = target
+                            onAutoScroll = { if (selectionManager.isSelecting) selectAt(autoScrollPointer, android.os.SystemClock.uptimeMillis()) }
+                            startAutoScroll()
                             tapTracker.lastTimestamp = 0L // prevent triple-tap double triggers
                         }
 
@@ -966,60 +1147,123 @@ internal fun TerminalWithAccessibility(
                         if (gestureType == GestureType.Undetermined && selectionManager.mode != SelectionMode.NONE && !selectionManager.isSelecting) {
                             val range = selectionManager.selectionRange
                             if (range != null) {
+                                val start = range.getStartPosition()
+                                val end = range.getEndPosition()
+                                val firstVisible = screenState.visibleLineIndex(0)
+                                val startViewportRow = start.first - firstVisible
+                                val endViewportRow = end.first - firstVisible
+                                val visualRange = SelectionRange(
+                                    if (startViewportRow in 0 until screenState.snapshot.rows) startViewportRow else -10000,
+                                    if (startViewportRow in 0 until screenState.snapshot.rows) textPaint.visualColumn(screenState, startViewportRow, start.second, baseCharWidth) else 0,
+                                    if (endViewportRow in 0 until screenState.snapshot.rows) endViewportRow else -10000,
+                                    if (endViewportRow in 0 until screenState.snapshot.rows) textPaint.visualColumn(screenState, endViewportRow, end.second, baseCharWidth) else 0,
+                                )
                                 val (touchingStart, touchingEnd) = isTouchingHandle(
                                     down.position,
-                                    range,
+                                    visualRange,
                                     baseCharWidth,
                                     baseCharHeight,
+                                    with(density) {
+                                        if (selectionManager.mode == SelectionMode.LINE) {
+                                            LINE_HANDLE_HIT_RADIUS.toPx()
+                                        } else {
+                                            HANDLE_HIT_RADIUS.toPx()
+                                        }
+                                    },
+                                    selectionManager.mode,
+                                    size.width.toFloat(),
+                                    with(density) { LINE_HANDLE_WIDTH.toPx() },
+                                    with(density) { LINE_HANDLE_GAP.toPx() },
                                 )
                                 if (touchingStart || touchingEnd) {
                                     gestureType = GestureType.HandleDrag
                                     isDraggingHandle = true
-                                    // Handle drag
+                                    selectionManager.restoreSelectionRange(SelectionRange(start.first, start.second, end.first, end.second))
+                                    val anchor = if (touchingStart) start else end
+                                    val anchorVisualCol = if (touchingStart) visualRange.startCol else visualRange.endCol
+                                    val grabOffset = Offset(
+                                        if (selectionManager.mode == SelectionMode.LINE) 0f else (anchorVisualCol + 0.5f) * baseCharWidth - down.position.x,
+                                        ((if (touchingStart) visualRange.startRow else visualRange.endRow) + 0.5f) * baseCharHeight - down.position.y,
+                                    )
+                                    fun handlePoint(position: Offset): Offset {
+                                        val target = if (isFinger) {
+                                            selectionHandleDragPosition(
+                                                position,
+                                                down.position,
+                                                down.position + grabOffset,
+                                                size.width.toFloat(),
+                                                size.height.toFloat(),
+                                                with(density) { SELECTION_EDGE_INSET.toPx() },
+                                            )
+                                        } else {
+                                            position + grabOffset
+                                        }
+                                        return selectionPoint(target, edgeReach = false)
+                                    }
+                                    val handleFilter = SelectionReleaseFilter<SelectionRange>()
+                                    selectionManager.selectionRange?.let { handleFilter.record(it, down.uptimeMillis) }
                                     showMagnifier = true
-                                    magnifierPosition = down.position
+                                    magnifierFingerPosition = down.position
+                                    magnifierTargetPosition = handlePoint(down.position)
 
                                     // Local variable to keep track of which handle we are moving in case they cross
                                     var isMovingStart = touchingStart
 
+                                    var releaseTime = down.uptimeMillis
+                                    fun dragHandle(position: Offset, time: Long) {
+                                        val target = handlePoint(position)
+                                        val newCol = (target.x / baseCharWidth).toInt()
+                                            .coerceIn(0, screenState.snapshot.cols - 1)
+                                        val newRow = (target.y / baseCharHeight).toInt()
+                                            .coerceIn(0, screenState.snapshot.rows - 1)
+                                        val current = selectionManager.selectionRange
+                                        if (current != null) {
+                                            val result = applyHandleDrag(
+                                                startRow = current.startRow,
+                                                startCol = current.startCol,
+                                                endRow = current.endRow,
+                                                endCol = current.endCol,
+                                                isMovingStart = isMovingStart,
+                                                newRow = screenState.visibleLineIndex(newRow),
+                                                newCol = if (selectionManager.mode == SelectionMode.LINE) {
+                                                    if (isMovingStart) 0 else screenState.snapshot.cols - 1
+                                                } else {
+                                                    textPaint.logicalColumn(screenState, newRow, newCol, baseCharWidth)
+                                                },
+                                            )
+                                            isMovingStart = result.isMovingStart
+                                            selectionManager.updateSelectionStart(result.startRow, result.startCol)
+                                            selectionManager.updateSelectionEnd(result.endRow, result.endCol)
+                                            selectionManager.adjustSelectionForMode(
+                                                screenState.snapshot.cols,
+                                                screenState.snapshot,
+                                                screenState.scrollbackPosition,
+                                            )
+                                            selectionManager.selectionRange?.let { handleFilter.record(it, time) }
+                                        }
+                                        magnifierFingerPosition = position
+                                        magnifierTargetPosition = target
+                                    }
+                                    onAutoScroll = { dragHandle(autoScrollPointer, android.os.SystemClock.uptimeMillis()) }
+                                    startAutoScroll()
                                     try {
-                                        drag(down.id) { change ->
-                                            val newCol =
-                                                (change.position.x / baseCharWidth).toInt()
-                                                    .coerceIn(0, screenState.snapshot.cols - 1)
-                                            val newRow =
-                                                (change.position.y / baseCharHeight).toInt()
-                                                    .coerceIn(0, screenState.snapshot.rows - 1)
-
-                                            val current = selectionManager.selectionRange
-                                            if (current != null) {
-                                                val result = applyHandleDrag(
-                                                    startRow = current.startRow,
-                                                    startCol = current.startCol,
-                                                    endRow = current.endRow,
-                                                    endCol = current.endCol,
-                                                    isMovingStart = isMovingStart,
-                                                    newRow = newRow,
-                                                    newCol = newCol,
-                                                )
-                                                isMovingStart = result.isMovingStart
-                                                selectionManager.updateSelectionStart(result.startRow, result.startCol)
-                                                selectionManager.updateSelectionEnd(result.endRow, result.endCol)
-                                                selectionManager.adjustSelectionForMode(
-                                                    screenState.snapshot.cols,
-                                                    screenState.snapshot,
-                                                    screenState.scrollbackPosition,
-                                                )
-                                            }
-
-                                            magnifierPosition = change.position
+                                        while (true) {
+                                            val event = awaitPointerEvent(PointerEventPass.Main)
+                                            val change = event.changes.find { it.id == down.id } ?: break
+                                            releaseTime = change.uptimeMillis
+                                            if (!change.pressed) break
+                                            autoScrollPointer = change.position
+                                            dragHandle(change.position, change.uptimeMillis)
                                             change.consume()
                                         }
                                     } finally {
                                         isDraggingHandle = false
+                                        autoScrollJob?.cancel()
                                     }
 
-                                    // After lifting finger, ensure selection is fully adjusted and handles snap
+                                    if (isFinger && !autoScrolled) {
+                                        handleFilter.resultAtRelease(releaseTime)?.let(selectionManager::restoreSelectionRange)
+                                    }
                                     selectionManager.adjustSelectionForMode(
                                         screenState.snapshot.cols,
                                         screenState.snapshot,
@@ -1049,19 +1293,28 @@ internal fun TerminalWithAccessibility(
                                     gestureType = GestureType.Selection
 
                                     // Start selection
-                                    val col = (down.position.x / baseCharWidth).toInt()
+                                    val target = selectionPoint(down.position)
+                                    val col = (target.x / baseCharWidth).toInt()
                                         .coerceIn(0, screenState.snapshot.cols - 1)
-                                    val row = (down.position.y / baseCharHeight).toInt()
+                                    val row = (target.y / baseCharHeight).toInt()
                                         .coerceIn(0, screenState.snapshot.rows - 1)
                                     selectionManager.startSelection(
                                         row,
-                                        col,
+                                        textPaint.logicalColumn(screenState, row, col, baseCharWidth),
                                         screenState.snapshot.cols,
                                         SelectionMode.CHARACTER,
+                                        screenState.snapshot,
+                                        screenState.scrollbackPosition,
                                     )
+                                    selectionManager.selectionRange?.let {
+                                        releaseFilter.record(it, down.uptimeMillis + viewConfiguration.longPressTimeoutMillis)
+                                    }
                                     haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                                     showMagnifier = true
-                                    magnifierPosition = down.position
+                                    magnifierFingerPosition = down.position
+                                    magnifierTargetPosition = target
+                                    onAutoScroll = { if (selectionManager.isSelecting) selectAt(autoScrollPointer, android.os.SystemClock.uptimeMillis()) }
+                                    startAutoScroll()
                                 }
                             }
                         } else {
@@ -1071,12 +1324,18 @@ internal fun TerminalWithAccessibility(
                         // 3. Setup tracking for velocity and multi-touch
                         val velocityTracker = VelocityTracker()
                         val primaryPointerId = down.id
+                        var selectionReleaseTime = down.uptimeMillis
                         velocityTracker.addPosition(down.uptimeMillis, down.position)
 
                         var secondPointer: PointerInputChange? = null
                         val multiTouchTimeout = down.uptimeMillis + WAIT_FOR_SECOND_TOUCH_MS
                         var panAccumulator = Offset.Zero
                         var initialScrollOffset = 0f
+
+                        // Set when the running application has taken over scrolling
+                        // via mouse tracking; null means scroll our own scrollback.
+                        var wheelScroller: WheelScroller? = null
+                        var wheelPanY = 0f
 
                         // 4. Main event loop
                         try {
@@ -1085,8 +1344,11 @@ internal fun TerminalWithAccessibility(
                                     awaitPointerEvent(PointerEventPass.Main)
 
                                 // Use the same pointer that started the gesture for consistency
-                                val change =
-                                    event.changes.find { it.id == primaryPointerId } ?: event.changes.first()
+                                val primaryChange = event.changes.find { it.id == primaryPointerId }
+                                val change = primaryChange ?: event.changes.first()
+                                selectionReleaseTime = change.uptimeMillis
+                                if (gestureType == GestureType.Selection && primaryChange?.pressed != true) break
+                                autoScrollPointer = change.position
 
                                 // Track velocity for all events, including the final UP event.
                                 // addPointerInputChange handles historical positions for better accuracy.
@@ -1114,6 +1376,18 @@ internal fun TerminalWithAccessibility(
                                         isUserScrolling = true
                                         // Adjust initialScrollOffset so (initial + panAccumulator) matches current offset
                                         initialScrollOffset = scrollOffset.value - panAccumulator.y
+                                        // Hand the gesture to the application if it asked
+                                        // for mouse reporting; it owns the viewport then.
+                                        wheelScroller = if (appOwnsPointer) {
+                                            WheelScroller(
+                                                emulator = terminalEmulator,
+                                                lineHeightPx = baseCharHeight,
+                                                anchorRow = (down.position.y / baseCharHeight).toInt(),
+                                                anchorCol = (down.position.x / baseCharWidth).toInt(),
+                                            )
+                                        } else {
+                                            null
+                                        }
                                         // Clear any active selection when scrolling starts
                                         if (selectionManager.mode != SelectionMode.NONE) {
                                             selectionManager.clearSelection()
@@ -1124,45 +1398,41 @@ internal fun TerminalWithAccessibility(
                                 // 4c. Handle based on gesture type
                                 when (gestureType) {
                                     GestureType.Selection -> {
-                                        if (selectionManager.isSelecting) {
-                                            val dragCol =
-                                                (change.position.x / baseCharWidth).toInt()
-                                                    .coerceIn(0, screenState.snapshot.cols - 1)
-                                            val dragRow =
-                                                (change.position.y / baseCharHeight).toInt()
-                                                    .coerceIn(0, screenState.snapshot.rows - 1)
-                                            selectionManager.updateSelection(
-                                                dragRow,
-                                                dragCol,
-                                            )
-                                            selectionManager.adjustSelectionForMode(
-                                                screenState.snapshot.cols,
-                                                screenState.snapshot,
-                                                screenState.scrollbackPosition,
-                                            )
-                                            magnifierPosition = change.position
+                                        if (selectionManager.isSelecting && change.pressed) {
+                                            selectAt(change.position, change.uptimeMillis)
                                         }
                                     }
 
                                     GestureType.Scroll -> {
-                                        // Update scroll offset using total pan from the start of the gesture
-                                        // to avoid stuttering from stale scrollOffset.value.
-                                        val currentMaxScroll =
-                                            screenState.snapshot.scrollback.size * baseCharHeight
-                                        val newOffset = (initialScrollOffset + panAccumulator.y)
-                                            .coerceIn(0f, currentMaxScroll)
+                                        val scroller = wheelScroller
+                                        if (scroller != null) {
+                                            // The application scrolls itself; our own
+                                            // scrollback and offset stay put. Feed the
+                                            // delta since the last sample, taken from the
+                                            // accumulator so the travel that satisfied
+                                            // touch slop is not dropped.
+                                            scroller.scrollBy(panAccumulator.y - wheelPanY)
+                                            wheelPanY = panAccumulator.y
+                                        } else {
+                                            // Update scroll offset using total pan from the start of the gesture
+                                            // to avoid stuttering from stale scrollOffset.value.
+                                            val currentMaxScroll =
+                                                screenState.snapshot.scrollback.size * baseCharHeight
+                                            val newOffset = (initialScrollOffset + panAccumulator.y)
+                                                .coerceIn(0f, currentMaxScroll)
 
-                                        // Cancel any ongoing scroll or fling and snap to the new position.
-                                        // Using launch with cancel ensures the latest snap always wins.
-                                        scrollJob?.cancel()
-                                        scrollJob = launch {
-                                            scrollOffset.snapTo(newOffset)
+                                            // Cancel any ongoing scroll or fling and snap to the new position.
+                                            // Using launch with cancel ensures the latest snap always wins.
+                                            scrollJob?.cancel()
+                                            scrollJob = launch {
+                                                scrollOffset.snapTo(newOffset)
+                                            }
+
+                                            // Update terminal buffer scrollback position
+                                            val scrolledLines =
+                                                (newOffset / baseCharHeight).toInt()
+                                            screenState.scrollBy(scrolledLines - screenState.scrollbackPosition)
                                         }
-
-                                        // Update terminal buffer scrollback position
-                                        val scrolledLines =
-                                            (newOffset / baseCharHeight).toInt()
-                                        screenState.scrollBy(scrolledLines - screenState.scrollbackPosition)
                                     }
 
                                     else -> {}
@@ -1173,6 +1443,7 @@ internal fun TerminalWithAccessibility(
                             }
                         } finally {
                             isUserScrolling = false
+                            autoScrollJob?.cancel()
                         }
 
                         // 5. Handle zoom if multi-touch was detected
@@ -1228,16 +1499,24 @@ internal fun TerminalWithAccessibility(
                             GestureType.Scroll -> {
                                 // Apply fling animation
                                 val velocity = velocityTracker.calculateVelocity()
+                                val scroller = wheelScroller
                                 scrollJob?.cancel()
                                 scrollJob = launch {
-                                    scrollOffset.animateDecay(
-                                        initialVelocity = velocity.y,
-                                        animationSpec = splineBasedDecay(density),
-                                    ) {
-                                        // Update terminal buffer during animation
-                                        val scrolledLines =
-                                            (value / baseCharHeight).toInt()
-                                        screenState.scrollBy(scrolledLines - screenState.scrollbackPosition)
+                                    if (scroller != null) {
+                                        // The application scrolls itself, so the fling is
+                                        // reported rather than animated; the scroller owns
+                                        // the decay and the bound that stops it.
+                                        scroller.fling(velocity.y, splineBasedDecay(density))
+                                    } else {
+                                        scrollOffset.animateDecay(
+                                            initialVelocity = velocity.y,
+                                            animationSpec = splineBasedDecay(density),
+                                        ) {
+                                            // Update terminal buffer during animation
+                                            val scrolledLines =
+                                                (value / baseCharHeight).toInt()
+                                            screenState.scrollBy(scrolledLines - screenState.scrollbackPosition)
+                                        }
                                     }
                                 }
                             }
@@ -1245,24 +1524,48 @@ internal fun TerminalWithAccessibility(
                             GestureType.Selection -> {
                                 showMagnifier = false
                                 if (selectionManager.isSelecting) {
+                                    if (isFinger && !autoScrolled) {
+                                        releaseFilter.resultAtRelease(selectionReleaseTime)
+                                            ?.let(selectionManager::restoreSelectionRange)
+                                    }
                                     selectionManager.endSelection()
                                 }
                             }
 
                             GestureType.Undetermined -> {
                                 // This is a tap. If a selection is active, clear it.
-                                // Otherwise, check for hyperlink or forward the tap.
+                                // Otherwise the application gets it if it asked for the
+                                // mouse; failing that, check for a hyperlink and forward.
+                                val tapCol = (down.position.x / baseCharWidth).toInt()
+                                    .coerceIn(0, screenState.snapshot.cols - 1)
+                                val tapRow = (down.position.y / baseCharHeight).toInt()
+                                    .coerceIn(0, screenState.snapshot.rows - 1)
+
+                                // Request focus when terminal is tapped to show keyboard
+                                fun forwardTap() {
+                                    if (currentKeyboardEnabled) {
+                                        focusRequester.requestFocus()
+                                        if (currentShouldShowIme) imeInputView?.showIme()
+                                    }
+                                    currentOnTerminalTap()
+                                }
+
                                 if (selectionManager.mode != SelectionMode.NONE) {
                                     selectionManager.clearSelection()
+                                } else if (appOwnsPointer) {
+                                    // The application owns the viewport, so it owns the
+                                    // click too — including on anything that looks like a
+                                    // link, which it drew and will handle itself. Sent as
+                                    // one click so the release cannot go missing.
+                                    // Long-press selection stays local: it remains the way
+                                    // to copy text out of a full-screen application.
+                                    terminalEmulator.mouseClick(MouseButton.LEFT, tapRow, tapCol)
+                                    forwardTap()
                                 } else {
                                     // Check if tap is on a hyperlink
-                                    val tapCol = (down.position.x / baseCharWidth).toInt()
-                                        .coerceIn(0, screenState.snapshot.cols - 1)
-                                    val tapRow = (down.position.y / baseCharHeight).toInt()
-                                        .coerceIn(0, screenState.snapshot.rows - 1)
                                     val hyperlinkUrl = screenState.getHyperlinkUrlAt(
                                         tapRow,
-                                        tapCol,
+                                        textPaint.logicalColumn(screenState, tapRow, tapCol, baseCharWidth),
                                         terminalEmulator.autoDetectUrls,
                                     )
 
@@ -1270,11 +1573,7 @@ internal fun TerminalWithAccessibility(
                                         // User tapped on a hyperlink
                                         currentOnHyperlinkClick(hyperlinkUrl)
                                     } else {
-                                        // Request focus when terminal is tapped to show keyboard
-                                        if (keyboardEnabled) {
-                                            focusRequester.requestFocus()
-                                        }
-                                        currentOnTerminalTap()
+                                        forwardTap()
                                     }
                                 }
                                 // Record tap for double-tap detection
@@ -1295,6 +1594,7 @@ internal fun TerminalWithAccessibility(
                     .clearAndSetSemantics {
                         // Hide from accessibility tree - AccessibilityOverlay provides semantic structure
                     }
+                    .clipToBounds()
                     .graphicsLayer {
                         translationX = zoomOffset.x * zoomScale
                         translationY = zoomOffset.y * zoomScale
@@ -1303,65 +1603,96 @@ internal fun TerminalWithAccessibility(
                         transformOrigin = zoomOrigin
                     },
             ) {
-                TerminalRows(
-                    screenState = screenState,
-                    charWidth = baseCharWidth,
-                    charHeight = baseCharHeight,
-                    charBaseline = baseCharBaseline,
-                    textPaint = textPaint,
-                    underlinePaint = underlinePaint,
-                    defaultFg = foregroundColor,
-                    defaultBg = backgroundColor,
-                    autoDetectUrls = terminalEmulator.autoDetectUrls,
-                )
+                Box(
+                    Modifier.fillMaxSize().drawWithContent {
+                        val snapshot = screenState.snapshot
+                        terminalInversion.reset()
+                        if (inverseSelection(selectionBackgroundColor, selectionForegroundColor) && selectionManager.selectionRange != null) {
+                            for (row in 0 until snapshot.rows) {
+                                terminalInversion.selectLine(
+                                    screenState.getVisibleLine(row),
+                                    row,
+                                    screenState.visibleLineIndex(row),
+                                    selectionManager,
+                                    textPaint.layout(screenState, row, baseCharWidth),
+                                    baseCharWidth,
+                                    baseCharHeight,
+                                )
+                            }
+                        }
+                        val cursorVisible = snapshot.cursorVisible && screenState.scrollbackPosition == 0 && cursorBlinkVisible &&
+                            snapshot.cursorRow in 0 until snapshot.rows && snapshot.cursorCol in 0 until snapshot.cols
+                        val cursorLine = if (cursorVisible) screenState.getVisibleLine(snapshot.cursorRow) else null
+                        val cursorCol = cursorLine?.let { cursorLeadColumn(it, snapshot.cursorCol) } ?: 0
+                        val visualCol = if (cursorVisible) textPaint.visualColumn(screenState, snapshot.cursorRow, cursorCol, baseCharWidth) else 0
+                        if (cursorLine != null) {
+                            terminalInversion.cursor(
+                                cursorBounds(
+                                    snapshot.cursorRow,
+                                    visualCol,
+                                    cursorLine.cells.width(cursorCol).coerceAtLeast(1),
+                                    baseCharWidth,
+                                    baseCharHeight,
+                                    snapshot.cursorShape,
+                                    textPaint.resolvedRtl(screenState, snapshot.cursorRow, cursorCol, baseCharWidth),
+                                ),
+                            )
+                        }
+                        terminalInversion.draw(drawContext.canvas.nativeCanvas) {
+                            drawContent()
+                            if (cursorLine != null && composeController.pendingDeadChar != 0) {
+                                val cells = cursorLine.cells
+                                val fixedSelection = !inverseSelection(selectionBackgroundColor, selectionForegroundColor) &&
+                                    (
+                                        selectionManager.isCellSelected(screenState.visibleLineIndex(snapshot.cursorRow), cursorCol, cursorLine) ||
+                                            (cells.width(cursorCol) == 2 && selectionManager.isCellSelected(screenState.visibleLineIndex(snapshot.cursorRow), cursorCol + 1, cursorLine))
+                                        )
+                                val color = if (fixedSelection) {
+                                    selectionForegroundColor.takeUnless { it == Color.Unspecified } ?: Color.Black
+                                } else if (cells.flags(cursorCol) and 32 != 0) {
+                                    cells.background(cursorCol)
+                                } else {
+                                    cells.foreground(cursorCol)
+                                }
+                                drawPendingDeadChar(
+                                    snapshot.cursorRow,
+                                    visualCol,
+                                    baseCharWidth,
+                                    baseCharHeight,
+                                    color,
+                                    composeController.pendingDeadChar,
+                                    baseCharBaseline,
+                                    textPaint,
+                                )
+                            }
+                        }
+                    },
+                ) {
+                    TerminalRows(
+                        screenState = screenState,
+                        charWidth = baseCharWidth,
+                        charHeight = baseCharHeight,
+                        charBaseline = baseCharBaseline,
+                        textPaint = textPaint,
+                        underlinePaint = underlinePaint,
+                        defaultFg = foregroundColor,
+                        defaultBg = backgroundColor,
+                        autoDetectUrls = terminalEmulator.autoDetectUrls,
+                        selectionManager = selectionManager,
+                        selectionBackgroundColor = selectionBackgroundColor,
+                        selectionForegroundColor = selectionForegroundColor,
+                    )
+                }
 
                 Canvas(modifier = Modifier.fillMaxSize()) {
                     val snapshot = screenState.snapshot
-
-                    if (selectionManager.mode != SelectionMode.NONE) {
-                        for (row in 0 until snapshot.rows) {
-                            val line = screenState.getVisibleLine(row)
-                            drawLine(
-                                line = line,
-                                row = row,
-                                charWidth = baseCharWidth,
-                                charHeight = baseCharHeight,
-                                charBaseline = baseCharBaseline,
-                                textPaint = textPaint,
-                                underlinePaint = underlinePaint,
-                                defaultFg = foregroundColor,
-                                defaultBg = backgroundColor,
-                                selectionManager = selectionManager,
-                                autoDetectUrls = terminalEmulator.autoDetectUrls,
-                                selectionBackgroundColor = selectionBackgroundColor,
-                                selectionForegroundColor = selectionForegroundColor,
-                                selectedOnly = true,
-                            )
-                        }
-                    }
-
-                    // Draw cursor (only when viewing current screen, not scrollback)
-                    if (snapshot.cursorVisible && screenState.scrollbackPosition == 0 && cursorBlinkVisible) {
-                        drawCursor(
-                            row = snapshot.cursorRow,
-                            col = snapshot.cursorCol,
-                            charWidth = baseCharWidth,
-                            charHeight = baseCharHeight,
-                            foregroundColor = foregroundColor,
-                            backgroundColor = backgroundColor,
-                            cursorShape = snapshot.cursorShape,
-                            pendingDeadChar = composeController.pendingDeadChar,
-                            charBaseline = baseCharBaseline,
-                            textPaint = textPaint,
-                        )
-                    }
 
                     // Draw compose mode overlay
                     if (composeMode.isActive && screenState.scrollbackPosition == 0) {
                         drawComposeOverlay(
                             buffer = composeMode.buffer,
                             cursorRow = snapshot.cursorRow,
-                            cursorCol = snapshot.cursorCol,
+                            cursorCol = textPaint.visualColumn(screenState, snapshot.cursorRow, snapshot.cursorCol, baseCharWidth),
                             totalCols = snapshot.cols,
                             charWidth = baseCharWidth,
                             charHeight = baseCharHeight,
@@ -1374,23 +1705,34 @@ internal fun TerminalWithAccessibility(
                     if (selectionManager.mode != SelectionMode.NONE && !selectionManager.isSelecting) {
                         val range = selectionManager.selectionRange
                         if (range != null) {
+                            val firstVisible = screenState.visibleLineIndex(0)
                             val startPosition = range.getStartPosition()
-                            drawSelectionHandle(
-                                row = startPosition.first,
-                                col = startPosition.second,
-                                charWidth = baseCharWidth,
-                                charHeight = baseCharHeight,
-                                pointingDown = false,
-                            )
-
                             val endPosition = range.getEndPosition()
-                            drawSelectionHandle(
-                                row = endPosition.first,
-                                col = endPosition.second,
-                                charWidth = baseCharWidth,
-                                charHeight = baseCharHeight,
-                                pointingDown = true,
-                            )
+                            val sameRow = startPosition.first == endPosition.first
+                            val startRow = startPosition.first - firstVisible
+                            if (startRow in 0 until snapshot.rows) {
+                                drawSelectionHandle(
+                                    row = startRow,
+                                    col = textPaint.visualColumn(screenState, startRow, startPosition.second, baseCharWidth),
+                                    charWidth = baseCharWidth,
+                                    charHeight = baseCharHeight,
+                                    pointingDown = false,
+                                    lineMode = selectionManager.mode == SelectionMode.LINE,
+                                    sameRow = sameRow,
+                                )
+                            }
+                            val endRow = endPosition.first - firstVisible
+                            if (endRow in 0 until snapshot.rows) {
+                                drawSelectionHandle(
+                                    row = endRow,
+                                    col = textPaint.visualColumn(screenState, endRow, endPosition.second, baseCharWidth),
+                                    charWidth = baseCharWidth,
+                                    charHeight = baseCharHeight,
+                                    pointingDown = true,
+                                    lineMode = selectionManager.mode == SelectionMode.LINE,
+                                    sameRow = sameRow,
+                                )
+                            }
                         }
                     }
                 }
@@ -1421,7 +1763,8 @@ internal fun TerminalWithAccessibility(
         // Magnifying glass
         if (showMagnifier) {
             MagnifyingGlass(
-                position = magnifierPosition,
+                fingerPosition = magnifierFingerPosition,
+                targetPosition = magnifierTargetPosition,
                 screenState = screenState,
                 baseCharWidth = baseCharWidth,
                 baseCharHeight = baseCharHeight,
@@ -1453,13 +1796,15 @@ internal fun TerminalWithAccessibility(
                 // Try placing below the selection first
                 val handleHeightPx = with(density) { SELECTION_HANDLE_WIDTH.toPx() }
                 val marginPx = with(density) { 8.dp.toPx() }
-                var buttonY = (endPosition.first + 1) * baseCharHeight + handleHeightPx + marginPx
+                val endViewportRow = (endPosition.first - screenState.visibleLineIndex(0))
+                    .coerceIn(0, screenState.snapshot.rows - 1)
+                var buttonY = (endViewportRow + 1) * baseCharHeight + handleHeightPx + marginPx
 
                 if (buttonY + buttonHeightPx > availableHeight) {
                     // Doesn't fit below, place above the selection (clearing the handle if it's there)
                     // Note: endPosition might have a handle pointing down, but if the selection is
                     // short, we might be overlapping the start handle which points up.
-                    buttonY = endPosition.first * baseCharHeight - handleHeightPx - buttonHeightPx - marginPx
+                    buttonY = endViewportRow * baseCharHeight - handleHeightPx - buttonHeightPx - marginPx
                 }
 
                 val context = LocalContext.current
@@ -1492,12 +1837,6 @@ internal fun TerminalWithAccessibility(
                             FloatingActionButton(
                                 onClick = {
                                     overflowMenuExpanded = true
-                                    if (shouldShowIme) {
-                                        scope.launch {
-                                            delay(IME_SHOW_DELAY_MS)
-                                            imeInputView?.showIme()
-                                        }
-                                    }
                                 },
                                 modifier = Modifier
                                     .size(COPY_BUTTON_SIZE)
@@ -1515,18 +1854,19 @@ internal fun TerminalWithAccessibility(
                                 expanded = overflowMenuExpanded,
                                 onDismissRequest = {
                                     overflowMenuExpanded = false
-                                    if (shouldShowIme) {
-                                        scope.launch {
-                                            delay(IME_SHOW_DELAY_MS)
-                                            imeInputView?.showIme()
-                                        }
-                                    }
                                 },
                             ) {
                                 DropdownMenuItem(
                                     text = { Text(stringResource(R.string.terminal_selection_select_all)) },
                                     onClick = {
                                         selectionController.selectAll()
+                                        overflowMenuExpanded = false
+                                    },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text(stringResource(R.string.terminal_selection_select_all_visible)) },
+                                    onClick = {
+                                        selectionController.selectAllVisible()
                                         overflowMenuExpanded = false
                                     },
                                 )
@@ -1592,16 +1932,14 @@ internal fun TerminalWithAccessibility(
                     ImeInputView(context, keyboardHandler).apply {
                         // Set up key event handling
                         setOnKeyListener { _, _, event ->
-                            if (event.action == KeyEvent.ACTION_DOWN) {
-                                resetImeBuffer()
-                            }
-                            keyboardHandler.onKeyEvent(
-                                androidx.compose.ui.input.key.KeyEvent(event),
-                            )
+                            handleRawKeyEvent(event)
                         }
                         // Store reference for IME control
                         imeInputView = this
                     }
+                },
+                update = { view ->
+                    view.onPasteRequest = onPasteRequest
                 },
                 modifier = Modifier
                     .size(1.dp)
@@ -1626,51 +1964,56 @@ private fun TerminalRows(
     defaultFg: Color,
     defaultBg: Color,
     autoDetectUrls: Boolean,
+    selectionManager: SelectionManager,
+    selectionBackgroundColor: Color,
+    selectionForegroundColor: Color,
 ) {
-    val density = LocalDensity.current
-    val rowHeight = with(density) { charHeight.toDp() }
-    val snapshot = screenState.snapshot
-    val hyperlinkMasks = remember(snapshot.sequenceNumber, screenState.scrollbackPosition, autoDetectUrls) {
-        if (!autoDetectUrls) {
-            emptyList()
-        } else {
-            List(snapshot.rows) { row ->
-                BooleanArray(snapshot.cols) { col ->
-                    screenState.getHyperlinkUrlAt(row, col, autoDetectUrls = true) != null
+    val rowCount by remember(screenState) { derivedStateOf { screenState.snapshot.rows } }
+    Canvas(Modifier.fillMaxSize()) { TerminalFrameTrace.draw(screenState.snapshot) }
+    // Cross-row URL detection depends on visible contents, not cursor/sequence updates.
+    val hyperlinkMasks = remember(screenState, autoDetectUrls) {
+        derivedStateOf {
+            if (!autoDetectUrls) {
+                emptyList()
+            } else {
+                List(screenState.snapshot.rows) { row ->
+                    BooleanArray(screenState.snapshot.cols) { col -> screenState.getHyperlinkUrlAt(row, col, autoDetectUrls = true) != null }
                 }
             }
         }
     }
 
-    for (row in 0 until snapshot.rows) {
-        val line = screenState.getVisibleLine(row)
-        key(row, line.lastModified, line.semanticSegments, screenState.scrollbackPosition) {
-            Canvas(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(rowHeight)
-                    .offset(y = with(density) { (row * charHeight).toDp() }),
-            ) {
-                drawLine(
-                    line = line,
-                    row = 0,
-                    charWidth = charWidth,
-                    charHeight = charHeight,
-                    charBaseline = charBaseline,
-                    textPaint = textPaint,
-                    underlinePaint = underlinePaint,
-                    defaultFg = defaultFg,
-                    defaultBg = defaultBg,
-                    selectionManager = null,
-                    autoDetectUrls = autoDetectUrls,
-                    hyperlinkMask = hyperlinkMasks.getOrNull(row),
-                )
+    // Every display list covers the viewport, including ink outside its row.
+    // Compose re-records changed rows; all backgrounds are below all glyphs.
+    for (backgrounds in listOf(true, false)) {
+        for (row in 0 until rowCount) {
+            val line = remember(screenState, row) { derivedStateOf { screenState.getVisibleLine(row) } }
+            key(backgrounds, row) {
+                Canvas(modifier = Modifier.fillMaxSize()) {
+                    drawLine(
+                        line = line.value,
+                        aboveLine = if (row > 0) screenState.getVisibleLine(row - 1) else null,
+                        belowLine = if (row + 1 < rowCount) screenState.getVisibleLine(row + 1) else null,
+                        row = row, charWidth = charWidth,
+                        charHeight = charHeight, charBaseline = charBaseline,
+                        textPaint = textPaint, underlinePaint = underlinePaint,
+                        defaultFg = defaultFg, defaultBg = defaultBg,
+                        selectionManager = selectionManager,
+                        autoDetectUrls = autoDetectUrls,
+                        hyperlinkMask = hyperlinkMasks.value.getOrNull(row),
+                        selectionBackgroundColor = selectionBackgroundColor,
+                        selectionForegroundColor = selectionForegroundColor,
+                        backgroundsOnly = backgrounds,
+                        shapedLine = (textPaint as? TerminalTextPaint)?.layout(screenState, row, charWidth),
+                        selectionRow = screenState.visibleLineIndex(row),
+                    )
+                }
             }
         }
     }
 }
 
-private fun DrawScope.drawLine(
+internal fun DrawScope.drawLine(
     line: TerminalLine,
     row: Int,
     charWidth: Float,
@@ -1683,104 +2026,162 @@ private fun DrawScope.drawLine(
     selectionManager: SelectionManager?,
     autoDetectUrls: Boolean = false,
     hyperlinkMask: BooleanArray? = null,
-    selectionBackgroundColor: Color = Color(0xFFB3D7FF),
-    selectionForegroundColor: Color = Color.Black,
-    selectedOnly: Boolean = false,
+    selectionBackgroundColor: Color = Color.Unspecified,
+    selectionForegroundColor: Color = Color.Unspecified,
+    backgroundsOnly: Boolean? = null,
+    aboveLine: TerminalLine? = null,
+    belowLine: TerminalLine? = null,
+    shapedLine: ShapedLine? = null,
+    selectionRow: Int = row,
 ) {
-    val y = row * charHeight
-    var x = 0f
-
-    line.cells.forEachIndexed { col, cell ->
-        val cellWidth = charWidth * cell.width
-
-        // Check if this cell is selected
-        val isSelected = selectionManager?.isCellSelected(row, col, line) == true
-        if (selectedOnly && !isSelected) {
-            x += cellWidth
-            return@forEachIndexed
+    // Standalone callers need the same final-pixel effect as a complete terminal.
+    if (backgroundsOnly == null) {
+        fun drawPasses() {
+            for (backgrounds in listOf(true, false)) {
+                drawLine(
+                    line, row, charWidth, charHeight, charBaseline, textPaint, underlinePaint,
+                    defaultFg, defaultBg, selectionManager, autoDetectUrls, hyperlinkMask,
+                    selectionBackgroundColor, selectionForegroundColor, backgrounds, aboveLine, belowLine,
+                    shapedLine, selectionRow,
+                )
+            }
         }
-
-        // Check if this cell is part of a hyperlink
-        val isHyperlink = hyperlinkMask?.getOrNull(col) ?: (line.getHyperlinkUrlAt(col, autoDetectUrls) != null)
-
-        // Determine colors (handle reverse video and selection)
-        val baseFgColor = if (cell.reverse) cell.bgColor else cell.fgColor
-        val bgColor = if (cell.reverse) cell.fgColor else cell.bgColor
-
-        // Draw background (with selection highlight)
-        val finalBgColor = if (isSelected) selectionBackgroundColor else bgColor
-        if (finalBgColor != defaultBg || isSelected) {
-            drawRect(
-                color = finalBgColor,
-                topLeft = Offset(x, y),
-                size = Size(cellWidth, charHeight),
+        if (selectionManager?.selectionRange != null && inverseSelection(selectionBackgroundColor, selectionForegroundColor)) {
+            val inversion = TerminalInversion()
+            inversion.selectLine(
+                line,
+                row,
+                selectionRow,
+                selectionManager,
+                shapedLine ?: (textPaint as? TerminalTextPaint)?.layout(line.cells, charWidth),
+                charWidth,
+                charHeight,
             )
+            inversion.draw(drawContext.canvas.nativeCanvas) { drawPasses() }
+        } else {
+            drawPasses()
         }
-
-        // Draw character
-        if ((cell.char != ' ' && cell.char != '\u0000') || cell.combiningChars.isNotEmpty()) {
-            // Force high contrast for text on the selection background
-            val fgColor = if (isSelected) selectionForegroundColor else baseFgColor
-
-            // Configure text paint for this cell
-            textPaint.color = fgColor.toArgb()
-            textPaint.isFakeBoldText = cell.bold
-            textPaint.textSkewX = if (cell.italic) -0.25f else 0f
-            // Underline if cell has underline OR if it's a hyperlink
-            textPaint.isUnderlineText = cell.underline == 1 || isHyperlink
-            textPaint.isStrikeThruText = cell.strike
-
-            // Draw text
-            if (cell.combiningChars.isEmpty()) {
-                val textBuffer = DRAW_TEXT_BUFFER.get()!!
-                textBuffer[0] = cell.char
-                drawContext.canvas.nativeCanvas.drawText(
-                    textBuffer,
-                    0,
-                    1,
-                    x,
-                    y + charBaseline,
-                    textPaint,
-                )
-            } else {
-                val text = buildString {
-                    append(cell.char)
-                    cell.combiningChars.forEach { append(it) }
-                }
-                drawContext.canvas.nativeCanvas.drawText(
-                    text,
-                    x,
-                    y + charBaseline,
-                    textPaint,
-                )
-            }
-
-            // Draw double underline if needed
-            if (cell.underline == 2) {
-                drawDoubleUnderline(
-                    x = x,
-                    y = y + charBaseline,
-                    width = cellWidth,
-                    color = fgColor,
-                    paint = underlinePaint,
-                )
-            }
-
-            // Draw curly underline if needed
-            if (cell.underline == 3) {
-                drawCurlyUnderline(
-                    x = x,
-                    y = y + charBaseline,
-                    width = cellWidth,
-                    charWidth = charWidth,
-                    color = fgColor,
-                    paint = underlinePaint,
-                )
-            }
-        }
-
-        x += cellWidth
+        return
     }
+    val y = row * charHeight
+    val cells = line.cells
+    val shaped = shapedLine ?: (textPaint as? TerminalTextPaint)?.layout(cells, charWidth)
+    // Observe selection once per row when inactive, not once per terminal cell.
+    val activeSelection = selectionManager?.takeIf {
+        it.selectionRange != null && !inverseSelection(selectionBackgroundColor, selectionForegroundColor)
+    }
+    if (backgroundsOnly) {
+        val behindBackground = line.images.filter { it.z < -1_073_741_824 }
+        if (behindBackground.isNotEmpty()) {
+            drawRect(defaultBg, Offset(0f, y), Size(cells.size * charWidth, charHeight))
+            behindBackground.forEach { it.draw(drawContext.canvas.nativeCanvas, row, charWidth, charHeight) }
+        }
+        // Coalesce adjacent backgrounds so a plain row needs a single rectangle.
+        var runColor = Color.Unspecified
+        var runStart = 0f
+        var runEnd = 0f
+        var runVisible = true
+        for (visualCol in 0 until cells.size) {
+            val col = shaped?.logicalColumn(visualCol) ?: visualCol
+            val width = cells.width(col)
+            if (width == 0) continue
+            val selected = activeSelection?.let {
+                it.isCellSelected(selectionRow, col, line) || (width == 2 && it.isCellSelected(selectionRow, col + 1, line))
+            } == true
+            val color = if (selected) {
+                selectionBackgroundColor.takeUnless { it == Color.Unspecified } ?: Color(0xFFB3D7FF)
+            } else if (cells.flags(col) and 32 != 0) {
+                cells.foreground(col)
+            } else {
+                cells.background(col)
+            }
+            val x = visualCol * charWidth
+            val visible = behindBackground.isEmpty() || selected || cells.flags(col) and 32 != 0 || cells.flags(col) and CellData.DEFAULT_BACKGROUND == 0
+            if (color != runColor || visible != runVisible) {
+                if (runEnd > runStart && runVisible) drawRect(runColor, Offset(runStart, y), Size(runEnd - runStart, charHeight))
+                runColor = color
+                runStart = x
+                runVisible = visible
+            }
+            runEnd = (visualCol + width) * charWidth
+        }
+        if (runEnd > runStart && runVisible) drawRect(runColor, Offset(runStart, y), Size(runEnd - runStart, charHeight))
+        return
+    }
+    val canvas = drawContext.canvas.nativeCanvas
+    shaped?.prepareDraw(canvas)
+    line.images.filter { it.z in -1_073_741_824 until 0 }.forEach { it.draw(canvas, row, charWidth, charHeight) }
+    textPaint.isUnderlineText = false
+    textPaint.isStrikeThruText = false
+    var paintedColor = Color.Unspecified
+    var paintedStyle = -1
+    for (col in 0 until cells.size) {
+        val width = cells.width(col)
+        if (width == 0) continue
+        val x = (shaped?.visualColumn(col) ?: col) * charWidth
+        val flags = cells.flags(col)
+        val underline = (flags ushr 1) and 3
+        val cellWidth = charWidth * width
+        val isSelected = activeSelection?.let {
+            it.isCellSelected(selectionRow, col, line) || (width == 2 && it.isCellSelected(selectionRow, col + 1, line))
+        } == true
+        val reversed = flags and 32 != 0
+        val fg = if (isSelected) {
+            selectionForegroundColor.takeUnless { it == Color.Unspecified } ?: Color.Black
+        } else if (reversed) {
+            cells.background(col)
+        } else {
+            cells.foreground(col)
+        }
+        val hyperlink = hyperlinkMask?.getOrNull(col) ?: (line.getHyperlinkUrlAt(col, autoDetectUrls) != null)
+        if (!cells.blank(col) && !cells.placeholder(col)) {
+            if (fg != paintedColor) {
+                textPaint.color = fg.toArgb()
+                paintedColor = fg
+            }
+            val style = flags and 9
+            if (style != paintedStyle) {
+                textPaint.isFakeBoldText = flags and 1 != 0
+                textPaint.textSkewX = if (flags and 8 != 0) -0.25f else 0f
+                paintedStyle = style
+            }
+            val box = cells.boxCharacter(col)
+            if (box != null) {
+                val renderer = (textPaint as? TerminalTextPaint)?.boxDrawing ?: TerminalBoxDrawing()
+                fun dashKind(ch: Char?, horizontal: Boolean): Int = when (ch?.code) {
+                    in if (horizontal) 0x254C..0x254D else 0x254E..0x254F -> 1
+                    in if (horizontal) 0x2504..0x2505 else 0x2506..0x2507 -> 2
+                    in if (horizontal) 0x2508..0x2509 else 0x250A..0x250B -> 3
+                    else -> 0
+                }
+                val neighboringDashes =
+                    dashKind(cells.boxCharacter(col - 1), true) or
+                        (dashKind(cells.boxCharacter(col + 1), true) shl 2) or
+                        (dashKind(aboveLine?.cells?.boxCharacter(col), false) shl 4) or
+                        (dashKind(belowLine?.cells?.boxCharacter(col), false) shl 6)
+                renderer.draw(canvas, box, x, y, cellWidth, charHeight, fg.toArgb(), textPaint.textSize, neighboringDashes)
+            } else {
+                if (shaped == null || android.os.Build.VERSION.SDK_INT < 31 || !shaped.drawCell(canvas, col, y + charBaseline, textPaint, charWidth, width)) {
+                    cells.draw(canvas, col, x, y + charBaseline, textPaint, cellWidth)
+                }
+            }
+        }
+        if (underline != 0 || hyperlink || flags and 128 != 0) underlinePaint.color = fg.toArgb()
+        if (underline == 1 || hyperlink) {
+            canvas.drawLine(x, y + charBaseline + 2f, x + cellWidth, y + charBaseline + 2f, underlinePaint)
+        }
+        if (flags and 128 != 0) {
+            val strikeY = y + charBaseline + textPaint.fontMetrics.ascent * 0.35f
+            canvas.drawLine(x, strikeY, x + cellWidth, strikeY, underlinePaint)
+        }
+        if (underline == 2) {
+            drawDoubleUnderline(x, y + charBaseline, cellWidth, fg, underlinePaint)
+        }
+        if (underline == 3) {
+            drawCurlyUnderline(x, y + charBaseline, cellWidth, charWidth, fg, underlinePaint)
+        }
+    }
+    line.images.filter { it.z >= 0 }.forEach { it.draw(canvas, row, charWidth, charHeight) }
 }
 
 /**
@@ -1938,34 +2339,50 @@ internal fun applyHandleDrag(
  * Check if a touch position is near a selection handle.
  * Returns (touchingStart, touchingEnd).
  */
-private fun isTouchingHandle(
+@VisibleForTesting
+internal fun isTouchingHandle(
     touchPos: Offset,
     range: SelectionRange,
     charWidth: Float,
     charHeight: Float,
-    hitRadius: Float = HANDLE_HIT_RADIUS,
+    hitRadius: Float,
+    mode: SelectionMode = SelectionMode.CHARACTER,
+    viewportWidth: Float = 0f,
+    lineHandleWidth: Float = 32f,
+    lineHandleGap: Float = 8f,
 ): Pair<Boolean, Boolean> {
     // Handle circles are drawn offset from the character edge by their radius (~12dp).
     // Start handle points up (circle above the character top),
     // end handle points down (circle below the character bottom).
     // Use a generous hit radius centered on the circle's visual center.
     val handleRadius = charHeight * 0.4f // approximate circle radius
-    val startPos = Offset(
-        range.startCol * charWidth + charWidth / 2,
-        range.startRow * charHeight - handleRadius,
-    )
-    val endPos = Offset(
-        range.endCol * charWidth + charWidth / 2,
-        range.endRow * charHeight + charHeight + handleRadius,
-    )
+    val sameRow = range.startRow == range.endRow
+    val offset = if (sameRow) (lineHandleWidth + lineHandleGap) / 2f else 0f
+    val startPos = if (mode == SelectionMode.LINE) {
+        Offset(
+            viewportWidth / 2f - offset,
+            (range.startRow + 0.5f) * charHeight,
+        )
+    } else {
+        Offset(range.startCol * charWidth + charWidth / 2, range.startRow * charHeight - handleRadius)
+    }
+    val endPos = if (mode == SelectionMode.LINE) {
+        Offset(
+            viewportWidth / 2f + offset,
+            (range.endRow + 0.5f) * charHeight,
+        )
+    } else {
+        Offset(range.endCol * charWidth + charWidth / 2, range.endRow * charHeight + charHeight + handleRadius)
+    }
 
     val distToStart = (touchPos - startPos).getDistance()
     val distToEnd = (touchPos - endPos).getDistance()
 
-    return Pair(
-        distToStart < hitRadius,
-        distToEnd < hitRadius,
-    )
+    return when {
+        distToStart >= hitRadius && distToEnd >= hitRadius -> false to false
+        distToStart <= distToEnd -> true to false
+        else -> false to true
+    }
 }
 
 /**
@@ -2042,7 +2459,8 @@ internal fun magnifierOffset(
  */
 @Composable
 private fun MagnifyingGlass(
-    position: Offset,
+    fingerPosition: Offset,
+    targetPosition: Offset,
     screenState: TerminalScreenState,
     baseCharWidth: Float,
     baseCharHeight: Float,
@@ -2054,9 +2472,10 @@ private fun MagnifyingGlass(
     autoDetectUrls: Boolean = false,
     componentWidth: Int = 0,
     componentHeight: Int = 0,
-    selectionBackgroundColor: Color = Color(0xFFB3D7FF),
-    selectionForegroundColor: Color = Color.Black,
+    selectionBackgroundColor: Color = Color.Unspecified,
+    selectionForegroundColor: Color = Color.Unspecified,
 ) {
+    val inversion = remember { TerminalInversion() }
     val magnifierSize = MAGNIFIER_SIZE_DP.dp
     val magnifierScale = MAGNIFIER_SCALE
     val density = LocalDensity.current
@@ -2072,7 +2491,7 @@ private fun MagnifyingGlass(
     }
 
     val magnifierPos = magnifierOffset(
-        position = position,
+        position = fingerPosition,
         magnifierSizePx = magnifierSizePx,
         verticalOffsetPx = verticalOffset,
         fingerHeightPx = fingerHeightPx,
@@ -2080,11 +2499,7 @@ private fun MagnifyingGlass(
         componentHeight = componentHeight,
     )
 
-    // The actual touch point that should be centered in the magnifier
-    val centerOffset = Offset(
-        x = position.x - (magnifierSizePx / magnifierScale) * MAGNIFIER_CENTER_OFFSET_MULTIPLIER,
-        y = position.y - (magnifierSizePx / magnifierScale) * MAGNIFIER_CENTER_OFFSET_MULTIPLIER,
-    )
+    val sourceTopLeft = magnifierSourceTopLeft(targetPosition, magnifierSizePx, magnifierScale)
 
     Box(
         modifier = Modifier
@@ -2111,34 +2526,76 @@ private fun MagnifyingGlass(
                 size = size,
             )
 
-            // Apply magnification and translate to center the touch point
-            translate(-centerOffset.x * magnifierScale, -centerOffset.y * magnifierScale) {
-                scale(magnifierScale, magnifierScale) {
+            // The selected touch point stays at the center even when the loupe moves at an edge.
+            scale(magnifierScale, magnifierScale, pivot = Offset.Zero) {
+                translate(-sourceTopLeft.x, -sourceTopLeft.y) {
                     // Calculate which rows to draw
-                    val centerRow = (position.y / baseCharHeight).toInt().coerceIn(0, screenState.snapshot.rows - 1)
+                    val centerRow = (targetPosition.y / baseCharHeight).toInt().coerceIn(0, screenState.snapshot.rows - 1)
 
-                    // Draw a few rows around the touch point
-                    for (rowOffset in -MAGNIFIER_ROW_RANGE..MAGNIFIER_ROW_RANGE) {
-                        val row = (centerRow + rowOffset).coerceIn(0, screenState.snapshot.rows - 1)
-                        val line = screenState.getVisibleLine(row)
-                        drawLine(
-                            line = line,
-                            row = row,
-                            charWidth = baseCharWidth,
-                            charHeight = baseCharHeight,
-                            charBaseline = baseCharBaseline,
-                            textPaint = textPaint,
-                            underlinePaint = underlinePaint,
-                            defaultFg = foregroundColor,
-                            defaultBg = backgroundColor,
-                            selectionManager = selectionManager,
-                            autoDetectUrls = autoDetectUrls,
-                            selectionBackgroundColor = selectionBackgroundColor,
-                            selectionForegroundColor = selectionForegroundColor,
-                        )
+                    val visibleRows = maxOf(0, centerRow - MAGNIFIER_ROW_RANGE)..minOf(screenState.snapshot.rows - 1, centerRow + MAGNIFIER_ROW_RANGE)
+                    inversion.reset()
+                    if (inverseSelection(selectionBackgroundColor, selectionForegroundColor)) {
+                        for (row in visibleRows) {
+                            inversion.selectLine(
+                                screenState.getVisibleLine(row),
+                                row,
+                                screenState.visibleLineIndex(row),
+                                selectionManager,
+                                (textPaint as? TerminalTextPaint)?.layout(screenState, row, baseCharWidth),
+                                baseCharWidth,
+                                baseCharHeight,
+                            )
+                        }
+                    }
+                    inversion.draw(drawContext.canvas.nativeCanvas) {
+                        // Draw a few rows around the touch point
+                        for (backgrounds in listOf(true, false)) {
+                            for (row in visibleRows) {
+                                val line = screenState.getVisibleLine(row)
+                                drawLine(
+                                    line = line,
+                                    row = row,
+                                    charWidth = baseCharWidth,
+                                    charHeight = baseCharHeight,
+                                    charBaseline = baseCharBaseline,
+                                    textPaint = textPaint,
+                                    underlinePaint = underlinePaint,
+                                    defaultFg = foregroundColor,
+                                    defaultBg = backgroundColor,
+                                    selectionManager = selectionManager,
+                                    autoDetectUrls = autoDetectUrls,
+                                    selectionBackgroundColor = selectionBackgroundColor,
+                                    selectionForegroundColor = selectionForegroundColor,
+                                    backgroundsOnly = backgrounds,
+                                    shapedLine = (textPaint as? TerminalTextPaint)?.layout(screenState, row, baseCharWidth),
+                                    selectionRow = screenState.visibleLineIndex(row),
+                                )
+                            }
+                        }
                     }
                 }
             }
+
+            val center = Offset(size.width / 2f, size.height / 2f)
+            val cell = magnifiedCellBounds(targetPosition, baseCharWidth, baseCharHeight, sourceTopLeft, magnifierScale)
+            val cellTopLeft = cell.topLeft
+            val cellSize = cell.size
+            val outerStroke = 2.dp.toPx()
+            val innerStroke = 1.dp.toPx()
+            drawRect(Color.Black.copy(alpha = 0.5f), cellTopLeft, cellSize, style = Stroke(outerStroke))
+            drawRect(Color.White.copy(alpha = 0.8f), cellTopLeft, cellSize, style = Stroke(innerStroke))
+
+            // Leave the center clear so the target remains visible without hiding its character.
+            val gap = 3.dp.toPx()
+            val reach = 9.dp.toPx()
+            fun drawTarget(color: Color, stroke: Float) {
+                drawLine(color, Offset(center.x - reach, center.y), Offset(center.x - gap, center.y), stroke)
+                drawLine(color, Offset(center.x + gap, center.y), Offset(center.x + reach, center.y), stroke)
+                drawLine(color, Offset(center.x, center.y - reach), Offset(center.x, center.y - gap), stroke)
+                drawLine(color, Offset(center.x, center.y + gap), Offset(center.x, center.y + reach), stroke)
+            }
+            drawTarget(Color.Black.copy(alpha = 0.85f), 3.dp.toPx())
+            drawTarget(Color.White, 1.dp.toPx())
         }
     }
 }
@@ -2152,8 +2609,27 @@ private fun DrawScope.drawSelectionHandle(
     charWidth: Float,
     charHeight: Float,
     pointingDown: Boolean,
+    lineMode: Boolean = false,
+    sameRow: Boolean = false,
     color: Color = Color.White,
 ) {
+    if (lineMode) {
+        val width = LINE_HANDLE_WIDTH.toPx()
+        val height = LINE_HANDLE_HEIGHT.toPx()
+        val gap = LINE_HANDLE_GAP.toPx()
+        val centerX = size.width / 2f + if (sameRow) {
+            if (pointingDown) (width + gap) / 2f else -(width + gap) / 2f
+        } else {
+            0f
+        }
+        drawRoundRect(
+            color = color,
+            topLeft = Offset(centerX - width / 2f, (row + 0.5f) * charHeight - height / 2f),
+            size = Size(width, height),
+            cornerRadius = CornerRadius(height / 2f),
+        )
+        return
+    }
     val handleWidthPx = SELECTION_HANDLE_WIDTH.toPx()
 
     // Position handle at the character position
@@ -2184,75 +2660,29 @@ private fun DrawScope.drawSelectionHandle(
     )
 }
 
-/**
- * Draw the cursor with shape support (block, underline, bar).
- */
-private fun DrawScope.drawCursor(
+/** Pending accents participate in the same inversion as the underlying terminal. */
+private fun DrawScope.drawPendingDeadChar(
     row: Int,
     col: Int,
     charWidth: Float,
     charHeight: Float,
     foregroundColor: Color,
-    backgroundColor: Color = Color.Transparent,
-    cursorShape: CursorShape = CursorShape.BLOCK,
-    pendingDeadChar: Int = 0,
-    charBaseline: Float = 0f,
-    textPaint: TextPaint? = null,
+    pendingDeadChar: Int,
+    charBaseline: Float,
+    textPaint: TextPaint,
 ) {
     val x = col * charWidth
     val y = row * charHeight
 
-    when (cursorShape) {
-        CursorShape.BLOCK -> {
-            // Block cursor - full cell rectangle outline
-            drawRect(
-                color = foregroundColor,
-                topLeft = Offset(x, y),
-                size = Size(charWidth, charHeight),
-                alpha = CURSOR_BLOCK_ALPHA,
-            )
-        }
-
-        CursorShape.UNDERLINE -> {
-            // Underline cursor - line at bottom of cell
-            val underlineHeight = charHeight * CURSOR_UNDERLINE_HEIGHT_RATIO
-            drawRect(
-                color = foregroundColor,
-                topLeft = Offset(x, y + charHeight - underlineHeight),
-                size = Size(charWidth, underlineHeight),
-                alpha = CURSOR_LINE_ALPHA,
-            )
-        }
-
-        CursorShape.BAR_LEFT -> {
-            // Bar cursor - vertical line at left of cell
-            val barWidth = charWidth * CURSOR_BAR_WIDTH_RATIO
-            drawRect(
-                color = foregroundColor,
-                topLeft = Offset(x, y),
-                size = Size(barWidth, charHeight),
-                alpha = CURSOR_LINE_ALPHA,
-            )
-        }
-    }
-
     // Draw pending dead character if present
-    if (pendingDeadChar != 0 && textPaint != null) {
+    if (pendingDeadChar != 0) {
         val savedColor = textPaint.color
         val savedBold = textPaint.isFakeBoldText
         val savedSkew = textPaint.textSkewX
         val savedUnderline = textPaint.isUnderlineText
         val savedStrike = textPaint.isStrikeThruText
 
-        // Use opposite color for block cursor to ensure visibility
-        val accentColor =
-            if (cursorShape == CursorShape.BLOCK) {
-                if (foregroundColor.luminance() > 0.5f) Color.Black else Color.White
-            } else {
-                foregroundColor
-            }
-
-        textPaint.color = accentColor.toArgb()
+        textPaint.color = foregroundColor.toArgb()
         textPaint.isFakeBoldText = false
         textPaint.textSkewX = 0f
         textPaint.isUnderlineText = false
@@ -2416,6 +2846,17 @@ private fun truncateForOverlay(buffer: String, availableCols: Int): String {
     val builder = StringBuilder("\u2026")
     codepoints.forEach { builder.appendCodePoint(it) }
     return builder.toString()
+}
+
+/** Text in the cursor's soft-wrapped logical line that precedes the cursor. */
+internal fun TerminalSnapshot.textBeforeCursor(): String {
+    val cursorLine = lines.getOrNull(cursorRow) ?: return ""
+    var firstRow = cursorRow
+    while (firstRow > 0 && lines[firstRow - 1].softWrapped) firstRow--
+    return buildString {
+        for (row in firstRow until cursorRow) append(lines[row].text)
+        append(cursorLine.cells.text(0, cursorCol.coerceIn(0, cursorLine.cells.size)))
+    }
 }
 
 /**

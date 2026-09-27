@@ -1,5 +1,6 @@
 import com.android.build.api.artifact.SingleArtifact
 import com.vanniktech.maven.publish.DeploymentValidation
+import org.jetbrains.dokka.gradle.engine.parameters.VisibilityModifier
 import org.jetbrains.dokka.gradle.formats.DokkaFormatPlugin
 import org.jetbrains.dokka.gradle.internal.InternalDokkaGradlePluginApi
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
@@ -33,7 +34,7 @@ apply<DokkaMarkdownPlugin>()
 val hostJniDir = layout.buildDirectory.dir("host-jni")
 val cppSourceDir = layout.projectDirectory.dir("src/main/cpp")
 
-val cmakeConfigureHost by tasks.registering(Exec::class) {
+val cmakeConfigureHost = tasks.register<Exec>("cmakeConfigureHost") {
     group = "build"
     description = "Configure the CMake host build of jni_cb_term"
     inputs.dir(cppSourceDir)
@@ -48,7 +49,7 @@ val cmakeConfigureHost by tasks.registering(Exec::class) {
     )
 }
 
-val cmakeBuildHost by tasks.registering(Exec::class) {
+val cmakeBuildHost = tasks.register<Exec>("cmakeBuildHost") {
     group = "build"
     description = "Build libjni_cb_term for the host JVM"
     dependsOn(cmakeConfigureHost)
@@ -65,7 +66,7 @@ val cmakeBuildHost by tasks.registering(Exec::class) {
 
 android {
     namespace = "org.connectbot.terminal"
-    compileSdk = 36
+    compileSdk = 37
 
     defaultConfig {
         minSdk = 24
@@ -131,6 +132,15 @@ android {
                 testTask.jvmArgs("-Djava.library.path=${hostJniDir.get().asFile.absolutePath}")
             }
         }
+    }
+
+    sourceSets {
+        getByName("test").kotlin.directories.add("src/sharedTest/java")
+        getByName("androidTest").kotlin.directories.add("src/sharedTest/java")
+        getByName("androidTest").assets.directories.add(
+            layout.buildDirectory.dir("benchmark-assets").get().asFile.absolutePath,
+        )
+        getByName("androidTest").assets.directories.add("src/test/resources/glyph-fixtures")
     }
 }
 
@@ -209,9 +219,15 @@ dependencies {
     testImplementation(libs.junit)
     testImplementation(libs.robolectric)
     testImplementation(libs.roborazzi.compose)
+    testImplementation(libs.roborazzi.capture)
     testImplementation(composeBom)
     testImplementation(libs.androidx.compose.ui.test.junit4)
     testImplementation(libs.mockk)
+    androidTestImplementation(composeBom)
+    androidTestImplementation(libs.androidx.compose.ui.test.junit4)
+    androidTestImplementation(libs.junit)
+    androidTestImplementation("androidx.test.ext:junit:1.3.0")
+    androidTestImplementation("androidx.test:runner:1.7.0")
     debugImplementation(libs.androidx.compose.ui.tooling)
     debugImplementation(libs.androidx.compose.ui.test.manifest)
 }
@@ -230,10 +246,11 @@ dokka {
     moduleName.set("ConnectBot Terminal")
 
     dokkaSourceSets.configureEach {
+        includes.from("README.md")
+        documentedVisibilities.set(setOf(VisibilityModifier.Public))
         sourceLink {
-            includes.from("README.md")
-            localDirectory.set(file("./"))
-            remoteUrl.set(uri("$gitHubUrl/blob/main"))
+            localDirectory.set(file("src/main/java"))
+            remoteUrl.set(uri("$gitHubUrl/blob/main/lib/src/main/java"))
             remoteLineSuffix.set("#L")
         }
     }

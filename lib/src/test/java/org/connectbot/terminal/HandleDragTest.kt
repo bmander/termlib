@@ -16,12 +16,33 @@
  */
 package org.connectbot.terminal
 
+import androidx.compose.ui.geometry.Offset
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class HandleDragTest {
+
+    @Test
+    fun overlappingHandleTargetsChooseCloserHandle() {
+        val range = SelectionRange(2, 10, 2, 11)
+        assertEquals(true to false, isTouchingHandle(Offset(105f, 50f), range, 10f, 20f, 40f))
+        assertEquals(false to true, isTouchingHandle(Offset(115f, 52f), range, 10f, 20f, 40f))
+    }
+
+    @Test
+    fun lineHandlesAreCenteredAndSeparatelyTouchableOnOneRow() {
+        val range = SelectionRange(2, 0, 2, 79)
+        assertEquals(
+            true to false,
+            isTouchingHandle(Offset(180f, 50f), range, 10f, 20f, 24f, SelectionMode.LINE, 400f, 32f, 8f),
+        )
+        assertEquals(
+            false to true,
+            isTouchingHandle(Offset(220f, 50f), range, 10f, 20f, 24f, SelectionMode.LINE, 400f, 32f, 8f),
+        )
+    }
 
     // Initial selection: start=(row=2, col=10), end=(row=2, col=40)
 

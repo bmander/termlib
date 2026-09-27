@@ -17,12 +17,16 @@
 package org.connectbot.terminal
 
 import android.content.Context
+import android.os.Build
 import android.os.SystemClock
+import android.text.InputType
 import android.view.KeyCharacterMap
 import android.view.KeyEvent
 import android.view.View
 import android.view.inputmethod.BaseInputConnection
 import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.ExtractedText
+import android.view.inputmethod.ExtractedTextRequest
 import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -33,6 +37,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
+import org.robolectric.annotation.Config
 import java.text.Normalizer
 
 @RunWith(AndroidJUnit4::class)
@@ -75,6 +80,44 @@ class ImeInputViewTest {
     private fun ImeInputView.ic(composeMode: Boolean = false): BaseInputConnection {
         isComposeModeActive = composeMode
         return onCreateInputConnection(EditorInfo()) as BaseInputConnection
+    }
+
+    @Test
+    fun testImePasteActionsInvokeTerminalPasteHandler() {
+        for (composeMode in listOf(false, true)) {
+            val view = makeView()
+            var pasteCount = 0
+            view.onPasteRequest = { pasteCount++ }
+            val ic = view.ic(composeMode)
+
+            assertTrue(ic.performContextMenuAction(android.R.id.paste))
+            assertEquals(1, pasteCount)
+            assertTrue(ic.performContextMenuAction(android.R.id.pasteAsPlainText))
+            assertEquals(2, pasteCount)
+            assertFalse(ic.performContextMenuAction(android.R.id.copy))
+            assertEquals(2, pasteCount)
+        }
+    }
+
+    @Test
+    fun testImePasteUsesUpdatedHandlerWithoutRecreatingConnection() {
+        val view = makeView()
+        val ic = view.ic()
+        assertFalse(ic.performContextMenuAction(android.R.id.paste))
+        assertFalse(ic.performContextMenuAction(android.R.id.pasteAsPlainText))
+
+        var firstCount = 0
+        var secondCount = 0
+        view.onPasteRequest = { firstCount++ }
+        assertTrue(ic.performContextMenuAction(android.R.id.paste))
+        view.onPasteRequest = { secondCount++ }
+        assertTrue(ic.performContextMenuAction(android.R.id.paste))
+        assertEquals(1, firstCount)
+        assertEquals(1, secondCount)
+
+        view.onPasteRequest = null
+        assertFalse(ic.performContextMenuAction(android.R.id.paste))
+        assertEquals(1, secondCount)
     }
 
     // === IME editable buffer reset on key events (compose mode — has a real Editable) ===
@@ -123,37 +166,300 @@ class ImeInputViewTest {
         assertEquals("", ic.getEditable()?.toString())
     }
 
-    // === commitText clears editable (regression guard) ===
+    // === committed context supports suggestion replacement ===
 
     @Test
-    fun testCommitTextClearsEditable() {
+    fun testCommitTextRetainsEditableContext() {
         val ic = makeView().ic(composeMode = true)
         ic.commitText("some text", 1)
 
-        assertEquals("", ic.getEditable()?.toString())
+        assertEquals("some text", ic.getEditable()?.toString())
     }
 
     @Test
-    fun testCommitTextWithActiveCompositionClearsEditable() {
+    fun testCommitTextWithActiveCompositionRetainsEditableContext() {
         val ic = makeView().ic(composeMode = true)
         ic.setComposingText("wor", 1)
         ic.commitText("word", 1)
 
+        assertEquals("word", ic.getEditable()?.toString())
+    }
+
+    @Test
+    fun testSuggestionReplacesPreviouslyCommittedWord() {
+        val (ic, outputs) = createKeyboardOutputCapture()
+
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            ic.commitText("com", 1)
+            ic.setComposingRegion(0, 3)
+            ic.commitText("cool", 1)
+        }
+        drainMainLooper()
+
+        assertEquals("cool", effectiveText(outputs))
+        assertEquals("cool", (ic as BaseInputConnection).getEditable()?.toString())
+    }
+
+    @Test
+    fun testSuggestionReplacementUsesConfiguredBackspaceByte() {
+        val (ic, outputs) = createKeyboardOutputCapture(delKeyMode = DelKeyMode.Backspace)
+
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            ic.commitText("autocorrect", 1)
+            ic.setComposingRegion(0, "autocorrect".length)
+            ic.commitText("auto-correct", 1)
+        }
+        drainMainLooper()
+
+        val received = outputs.flatMap { it.toList() }.toByteArray()
+        val expected = "autocorrect".toByteArray() +
+            ByteArray("correct".length) { 0x08 } +
+            "-correct".toByteArray()
+        assertTrue("IME rewrite did not use ^H for Backspace mode", expected.contentEquals(received))
+        assertEquals("auto-correct", effectiveText(outputs))
+    }
+
+    @Test
+    fun testSuggestionReplacementPreservesTrailingText() {
+        val (ic, outputs) = createKeyboardOutputCapture()
+
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            ic.commitText("com ", 1)
+            ic.setComposingRegion(0, 3)
+            ic.commitText("cool", 1)
+        }
+        drainMainLooper()
+
+        assertEquals("cool ", effectiveText(outputs))
+        assertEquals("cool ", (ic as BaseInputConnection).getEditable()?.toString())
+    }
+
+    @Test
+    @Config(sdk = [Build.VERSION_CODES.UPSIDE_DOWN_CAKE])
+    fun testGestureSuggestionReplaceTextRewritesCommittedWord() {
+        val (ic, outputs) = createKeyboardOutputCapture()
+
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            ic.commitText("we", 1)
+            ic.replaceText(0, 2, "sorry ", 1, null)
+        }
+        drainMainLooper()
+
+        assertEquals("sorry ", effectiveText(outputs))
+        assertEquals("sorry ", (ic as BaseInputConnection).getEditable()?.toString())
+    }
+
+    @Test
+    fun testTerminalShortcutDoesNotBecomeSuggestionContext() {
+        var ctrlActive = true
+        val restartRequests = mutableListOf<View>()
+        val modifierManager = object : ModifierManager {
+            override fun isCtrlActive() = ctrlActive
+            override fun isAltActive() = false
+            override fun isShiftActive() = false
+            override fun clearTransients() {
+                ctrlActive = false
+            }
+        }
+        val (ic, outputs) = createKeyboardOutputCapture(modifierManager, restartRequests)
+
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            ic.commitText("a", 1)
+            assertEquals("", (ic as BaseInputConnection).getEditable()?.toString())
+            ic.commitText("1", 1)
+        }
+        drainMainLooper()
+
+        assertTrue(outputs.flatMap { it.toList() }.contains(0x01.toByte()))
+        assertEquals("1", effectiveText(outputs))
+        assertEquals("1", (ic as BaseInputConnection).getEditable()?.toString())
+        assertEquals(1, restartRequests.size)
+    }
+
+    @Test
+    fun testTypeNullShortcutModeDispatchesRawCtrlKeyThenRestoresFullEditor() {
+        val capture = createImeShortcutCapture()
+        val shortcutAttrs = EditorInfo()
+        var initialConnection: BaseInputConnection? = null
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            initialConnection = capture.view.ic(composeMode = true)
+            capture.view.syncShortcutInputMode(ImeShortcutInputMode.TYPE_NULL)
+            val shortcutConnection = capture.view.onCreateInputConnection(shortcutAttrs)
+            shortcutConnection.sendKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_A))
+        }
+        drainMainLooper()
+
+        assertEquals(InputType.TYPE_NULL, shortcutAttrs.inputType and InputType.TYPE_MASK_CLASS)
+        assertTrue(capture.outputs.flatMap { it.toList() }.contains(0x01.toByte()))
+        assertEquals(2, capture.restartRequests.size)
+
+        val restoredAttrs = EditorInfo()
+        capture.view.onCreateInputConnection(restoredAttrs)
+        assertEquals(InputType.TYPE_CLASS_TEXT, restoredAttrs.inputType and InputType.TYPE_MASK_CLASS)
+        assertEquals("", initialConnection?.getEditable()?.toString())
+    }
+
+    @Test
+    fun testForceAsciiShortcutModeDispatchesComposingTextOnceThenRestoresEditor() {
+        val capture = createImeShortcutCapture()
+        val shortcutAttrs = EditorInfo()
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            capture.view.ic(composeMode = true)
+            capture.view.syncShortcutInputMode(ImeShortcutInputMode.FORCE_ASCII)
+            val shortcutConnection = capture.view.onCreateInputConnection(shortcutAttrs)
+            shortcutConnection.setComposingText("a", 1)
+            shortcutConnection.commitText("a", 1)
+        }
+        drainMainLooper()
+
+        assertTrue(shortcutAttrs.imeOptions and EditorInfo.IME_FLAG_FORCE_ASCII != 0)
+        assertEquals(1, capture.outputs.flatMap { it.toList() }.count { it == 0x01.toByte() })
+        assertEquals(2, capture.restartRequests.size)
+
+        val restoredAttrs = EditorInfo()
+        capture.view.onCreateInputConnection(restoredAttrs)
+        assertEquals(0, restoredAttrs.imeOptions and EditorInfo.IME_FLAG_FORCE_ASCII)
+    }
+
+    @Test
+    fun testCursorContextAllowsPartialEchoUntilCommittedTextAppears() {
+        val view = makeView()
+        val ic = view.ic(composeMode = true)
+        ic.commitText("cool", 1)
+
+        view.validateTerminalCursorContext("$ c")
+        assertEquals("cool", ic.getEditable()?.toString())
+        view.validateTerminalCursorContext("$ co")
+        assertEquals("cool", ic.getEditable()?.toString())
+        view.validateTerminalCursorContext("$ cool")
+        assertEquals("cool", ic.getEditable()?.toString())
+    }
+
+    @Test
+    fun testCursorContextClearsAfterConfirmedTextMovesElsewhere() {
+        val view = makeView()
+        val ic = view.ic(composeMode = true)
+        ic.commitText("cool", 1)
+        view.validateTerminalCursorContext("$ cool")
+
+        view.validateTerminalCursorContext("status: co")
+
         assertEquals("", ic.getEditable()?.toString())
     }
 
-    // === finishComposingText clears editable (regression guard) ===
+    @Test
+    fun testCursorContextClearsWhenEchoSettlesAtDifferentText() {
+        val restartRequests = mutableListOf<View>()
+        val view = ImeInputView(
+            context = context,
+            keyboardHandler = keyboardHandler,
+            inputMethodManager = noOpImm,
+            onRestartInput = { restartRequests.add(it) },
+        )
+        val ic = view.ic(composeMode = true)
+        ic.commitText("cool", 1)
+
+        view.validateTerminalCursorContext("unrelated TUI cursor")
+
+        assertEquals("", ic.getEditable()?.toString())
+        assertEquals(1, restartRequests.size)
+    }
 
     @Test
-    fun testFinishComposingTextClearsEditable() {
+    fun testCursorContextDropsOldCommitButKeepsNewComposition() {
+        val updates = mutableListOf<SelectionUpdate>()
+        val view = makeView(updates)
+        val ic = view.ic(composeMode = true)
+        ic.commitText("1", 1)
+        ic.setComposingText("this", 1)
+
+        view.validateTerminalCursorContext("new tmux window")
+
+        val editable = ic.getEditable()!!
+        assertEquals("this", editable.toString())
+        assertEquals(0, BaseInputConnection.getComposingSpanStart(editable))
+        assertEquals(4, BaseInputConnection.getComposingSpanEnd(editable))
+        assertTrue(
+            updates.any {
+                it.view === view &&
+                    it.selStart == 4 &&
+                    it.selEnd == 4 &&
+                    it.candidatesStart == 0 &&
+                    it.candidatesEnd == 4
+            },
+        )
+    }
+
+    // === finishComposingText retains editable context ===
+
+    @Test
+    fun testFinishComposingTextRetainsEditableContext() {
         val ic = makeView().ic(composeMode = true)
         ic.setComposingText("partial", 1)
         ic.finishComposingText()
 
-        assertEquals("", ic.getEditable()?.toString())
+        assertEquals("partial", ic.getEditable()?.toString())
     }
 
     // === updateSelection is called after ACTION_DOWN key events (compose mode) ===
+
+    @Test
+    fun testComposingTextReportsSelectionAndCandidateRange() {
+        val updates = mutableListOf<SelectionUpdate>()
+        val view = makeView(updates)
+        val ic = view.ic(composeMode = true)
+
+        ic.setComposingText("ㅂ", 1)
+
+        assertEquals(SelectionUpdate(view, 1, 1, 0, 1), updates.last())
+    }
+
+    @Test
+    fun testHangulCompositionReplacementKeepsEditableInSync() {
+        val capture = createComposeReplayCapture()
+        val ic = capture.ic as BaseInputConnection
+
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            ic.setComposingText("ㅂ", 1)
+            ic.setComposingText("바", 1)
+            ic.setComposingText("밭", 1)
+        }
+
+        val editable = ic.getEditable()!!
+        assertEquals("밭", editable.toString())
+        assertEquals(0, BaseInputConnection.getComposingSpanStart(editable))
+        assertEquals(1, BaseInputConnection.getComposingSpanEnd(editable))
+        assertEquals("밭", capture.composeMode.buffer)
+        assertTrue(capture.outputs.isEmpty())
+    }
+
+    @Test
+    fun testComposingSelectionUpdateWaitsForBatchEnd() {
+        val updates = mutableListOf<SelectionUpdate>()
+        val view = makeView(updates)
+        val ic = view.ic(composeMode = true)
+
+        ic.beginBatchEdit()
+        ic.setComposingText("ㅂ", 1)
+        ic.setComposingText("바", 1)
+        assertTrue(updates.isEmpty())
+
+        assertFalse(ic.endBatchEdit())
+        assertEquals(SelectionUpdate(view, 1, 1, 0, 1), updates.single())
+    }
+
+    @Test
+    fun testFullEditorExposesComposingTextToIme() {
+        val ic = makeView().ic(composeMode = true)
+        ic.setComposingText("바", 1)
+
+        val extracted = ic.getExtractedText(ExtractedTextRequest(), InputConnection.GET_TEXT_WITH_STYLES)
+
+        assertEquals("바", extracted?.text.toString())
+        assertEquals(1, extracted?.selectionStart)
+        assertEquals(1, extracted?.selectionEnd)
+        assertEquals(ExtractedText.FLAG_SINGLE_LINE, extracted?.flags)
+    }
 
     @Test
     fun testUpdateSelectionCalledAfterEnterKeyDown() {
@@ -239,17 +545,28 @@ class ImeInputViewTest {
 
     // === IME duplicate character tests (connectbot/connectbot#1955) ===
 
-    private fun createKeyboardOutputCapture(): Pair<InputConnection, MutableList<ByteArray>> {
+    private fun createKeyboardOutputCapture(
+        modifierManager: ModifierManager? = null,
+        restartRequests: MutableList<View>? = null,
+        delKeyMode: DelKeyMode = DelKeyMode.Delete,
+    ): Pair<InputConnection, MutableList<ByteArray>> {
         val outputs = mutableListOf<ByteArray>()
         val emulator = TerminalEmulatorFactory.create(
             initialRows = 24,
             initialCols = 80,
             onKeyboardInput = { data -> outputs.add(data.copyOf()) },
         )
-        val handler = KeyboardHandler(emulator)
+        val handler = KeyboardHandler(emulator, modifierManager = modifierManager).also {
+            it.unicodeCharLookup = { _, keyCode, _ -> if (keyCode == KeyEvent.KEYCODE_A) 'a'.code else 0 }
+            it.delKeyMode = delKeyMode
+        }
         var ic: InputConnection? = null
         InstrumentationRegistry.getInstrumentation().runOnMainSync {
-            val view = ImeInputView(context, handler)
+            val view = ImeInputView(
+                context = context,
+                keyboardHandler = handler,
+                onRestartInput = { view -> restartRequests?.add(view) },
+            )
             view.isComposeModeActive = true
             view.setOnKeyListener { _, _, event ->
                 handler.onKeyEvent(
@@ -259,6 +576,39 @@ class ImeInputViewTest {
             ic = view.onCreateInputConnection(EditorInfo())
         }
         return ic!! to outputs
+    }
+
+    private data class ImeShortcutCapture(
+        val view: ImeInputView,
+        val outputs: MutableList<ByteArray>,
+        val restartRequests: MutableList<View>,
+    )
+
+    private fun createImeShortcutCapture(): ImeShortcutCapture {
+        var ctrlActive = true
+        val modifierManager = object : ModifierManager {
+            override fun isCtrlActive() = ctrlActive
+            override fun isAltActive() = false
+            override fun isShiftActive() = false
+            override fun clearTransients() {
+                ctrlActive = false
+            }
+        }
+        val outputs = mutableListOf<ByteArray>()
+        val restartRequests = mutableListOf<View>()
+        val emulator = TerminalEmulatorFactory.create(
+            initialRows = 24,
+            initialCols = 80,
+            onKeyboardInput = { data -> outputs.add(data.copyOf()) },
+        )
+        val handler = KeyboardHandler(emulator, modifierManager = modifierManager)
+        val view = ImeInputView(
+            context = context,
+            keyboardHandler = handler,
+            inputMethodManager = noOpImm,
+            onRestartInput = { restartRequests.add(it) },
+        )
+        return ImeShortcutCapture(view, outputs, restartRequests)
     }
 
     private data class ComposeReplayCapture(

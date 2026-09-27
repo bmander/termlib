@@ -1,6 +1,6 @@
 /*
  * ConnectBot Terminal
- * Copyright 2025 Kenny Root
+ * Copyright 2026 Kenny Root
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,14 +14,16 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+package org.connectbot.terminal
 
-#include <cstdint>
-#include <cstdlib>
+/** How a full IME editor should request terminal shortcut characters. */
+enum class ImeShortcutInputMode {
+    /** Leave the active IME editor unchanged. */
+    DISABLED,
 
-#ifndef CB_TERM_MUTF8_H
-#define CB_TERM_MUTF8_H
+    /** Temporarily expose a non-rich editor so supporting IMEs generate raw key events. */
+    TYPE_NULL,
 
-char* utf8_to_mutf8(const char* utf8_in, size_t len, size_t* out_len);
-char* mutf8_to_utf8(const char* mutf8_in, size_t len, size_t* out_len);
-
-#endif //CB_TERM_MUTF8_H
+    /** Keep the rich editor but ask the IME to provide Roman alphabet characters. */
+    FORCE_ASCII,
+}
